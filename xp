@@ -33,6 +33,11 @@ def _debug(msg):
         print(f"  [DEBUG] {msg}", file=sys.stderr)
 
 
+def _remote_xpipe_tmp(user):
+    """XPipe's temp directory on a remote Linux/macOS host."""
+    return f"/tmp/xpipe/{user}"
+
+
 def _load_api_key():
     """Load API key from env var or config file."""
     key = os.environ.get("XPIPE_API_KEY")
@@ -40,14 +45,18 @@ def _load_api_key():
         _debug("API key loaded from XPIPE_API_KEY env var")
         return key.strip()
 
-    key_file = Path.home() / ".config" / "xp" / "key"
-    try:
-        key = key_file.read_text().strip()
-        if key:
-            _debug(f"API key loaded from {key_file}")
-            return key
-    except Exception:
-        pass
+    candidates = [
+        Path.home() / ".config" / "xp" / "key",  # Linux/macOS
+        Path(os.environ.get("LOCALAPPDATA", "")) / "xp" / "key",  # Windows
+    ]
+    for key_file in candidates:
+        try:
+            key = key_file.read_text().strip()
+            if key:
+                _debug(f"API key loaded from {key_file}")
+                return key
+        except Exception:
+            continue
 
     print("Error: No API key found.", file=sys.stderr)
     print("Set XPIPE_API_KEY env var or put your key in ~/.config/xp/key", file=sys.stderr)
@@ -296,22 +305,30 @@ def _display_menu(connections):
 
 def _load_xpipe_prefs():
     """Load XPipe preferences from local config file."""
-    prefs_file = Path.home() / ".xpipe" / "settings" / "preferences.json"
-    try:
-        with open(prefs_file, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        _debug(f"Could not read XPipe preferences: {e}")
-        return {}
+    candidates = [
+        Path.home() / ".xpipe" / "settings" / "preferences.json",  # Linux/macOS
+        Path(os.environ.get("LOCALAPPDATA", "")) / "xpipe" / "settings" / "preferences.json",  # Windows
+    ]
+    for prefs_file in candidates:
+        try:
+            with open(prefs_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            continue
+    _debug("Could not read XPipe preferences from any known location")
+    return {}
 
 
-def _build_rcfile(conn, prefs):
+def _build_rcfile(conn, prefs, shell_dialect="bash"):
     """Build shell rcfile content from XPipe preferences."""
     user = conn["user"]
+    xpipe_tmp = _remote_xpipe_tmp(user)
     lines = []
 
-    # Source the user's bashrc first
-    lines.append('[ -f ~/.bashrc ] && source ~/.bashrc')
+    if shell_dialect in ("bash", "sh"):
+        lines.append('[ -f ~/.bashrc ] && source ~/.bashrc')
+    elif shell_dialect == "zsh":
+        lines.append('[ -f ~/.zshrc ] && source ~/.zshrc')
 
     # Clear terminal if XPipe has that enabled
     if prefs.get("clearTerminalOnInit", False):
@@ -324,30 +341,42 @@ def _build_rcfile(conn, prefs):
         config_text = prompt.get("configuration")
 
         if prompt_type == "starship":
-            bin_dir = f"/tmp/xpipe/{user}/bin/starship"
-            config_path = f"/tmp/xpipe/{user}/prompt/starship/starship.toml"
+            bin_dir = f"{xpipe_tmp}/bin/starship"
+            config_path = f"{xpipe_tmp}/prompt/starship/starship.toml"
             lines.append(f'export PATH="{bin_dir}:$PATH"')
             if config_text:
                 lines.append(f'export STARSHIP_CONFIG="{config_path}"')
             lines.append('if command -v starship > /dev/null 2>&1; then')
-            lines.append('    eval "$(starship init bash)"')
+            if shell_dialect in ("bash", "sh"):
+                lines.append('    eval "$(starship init bash)"')
+            elif shell_dialect == "zsh":
+                lines.append('    eval "$(starship init zsh)"')
+            elif shell_dialect == "fish":
+                lines.append('    starship init fish | source')
             lines.append('fi')
 
         elif prompt_type == "ohmyposh":
-            bin_dir = f"/tmp/xpipe/{user}/bin/oh-my-posh"
-            config_path = f"/tmp/xpipe/{user}/prompt/ohmyposh/config.json"
+            bin_dir = f"{xpipe_tmp}/bin/oh-my-posh"
+            config_path = f"{xpipe_tmp}/prompt/ohmyposh/config.json"
             lines.append(f'export PATH="{bin_dir}:$PATH"')
             lines.append('if command -v oh-my-posh > /dev/null 2>&1; then')
-            if config_text:
-                lines.append(f'    eval "$(oh-my-posh init bash --config {config_path})"')
+            if shell_dialect in ("bash", "sh"):
+                init_cmd = 'oh-my-posh init bash'
+            elif shell_dialect == "zsh":
+                init_cmd = 'oh-my-posh init zsh'
+            elif shell_dialect == "fish":
+                init_cmd = 'oh-my-posh init fish'
             else:
-                lines.append('    eval "$(oh-my-posh init bash)"')
+                init_cmd = 'oh-my-posh init bash'
+            if config_text:
+                init_cmd += f' --config {config_path}'
+            lines.append(f'    eval "$({init_cmd})"')
             lines.append('fi')
 
     # Terminal init script from XPipe settings
     init_script = prefs.get("terminalInitScript")
     if init_script:
-        lines.append(f'# XPipe terminal init script')
+        lines.append('# XPipe terminal init script')
         lines.append(init_script)
 
     # Set terminal title to connection name
@@ -362,16 +391,21 @@ def _launch_connection(conn, token):
 
     uuid = conn["uuid"]
     user = conn["user"]
+    xpipe_tmp = _remote_xpipe_tmp(user)
     prefs = _load_xpipe_prefs()
 
-    # Build rcfile from XPipe preferences
-    rcfile = _build_rcfile(conn, prefs)
-    encoded = base64.b64encode(rcfile.encode()).decode()
-
-    # Start shell session to prepare remote
+    # Start shell session to prepare remote and detect shell dialect
     _debug("Starting shell session on remote")
     result = _api_post("/shell/start", {"connection": uuid}, token)
+    shell_dialect = "bash"
     if result is not None:
+        shell_dialect = result.get("shellDialect", "bash")
+        _debug(f"Remote shell dialect: {shell_dialect}")
+
+        # Build rcfile from XPipe preferences
+        rcfile = _build_rcfile(conn, prefs, shell_dialect)
+        encoded = base64.b64encode(rcfile.encode()).decode()
+
         # Ensure prompt tool binary exists
         prompt = prefs.get("terminalPrompt")
         if prompt:
@@ -379,8 +413,8 @@ def _launch_connection(conn, token):
             config_text = prompt.get("configuration")
 
             if prompt_type == "starship":
-                bin_dir = f"/tmp/xpipe/{user}/bin/starship"
-                config_dir = f"/tmp/xpipe/{user}/prompt/starship"
+                bin_dir = f"{xpipe_tmp}/bin/starship"
+                config_dir = f"{xpipe_tmp}/prompt/starship"
                 starship_bin = f"{bin_dir}/starship"
 
                 # Check and install starship if needed
@@ -407,8 +441,8 @@ def _launch_connection(conn, token):
                     }, token)
 
             elif prompt_type == "ohmyposh":
-                bin_dir = f"/tmp/xpipe/{user}/bin/oh-my-posh"
-                config_dir = f"/tmp/xpipe/{user}/prompt/ohmyposh"
+                bin_dir = f"{xpipe_tmp}/bin/oh-my-posh"
+                config_dir = f"{xpipe_tmp}/prompt/ohmyposh"
                 omp_bin = f"{bin_dir}/oh-my-posh"
 
                 check = _api_post("/shell/exec", {
@@ -462,19 +496,31 @@ def _launch_connection(conn, token):
                             rcfile += f"\n# XPipe script: {' '.join(info.get('name', []))}\n{script_text}\n"
                             encoded = base64.b64encode(rcfile.encode()).decode()
 
-        # Write rcfile to remote
-        _debug("Writing rcfile to remote")
+        # Write rcfile to remote (user-specific to avoid collisions)
+        rc_path = f"/tmp/.xp_rc_{user}"
+        _debug(f"Writing rcfile to remote: {rc_path}")
         _api_post("/shell/exec", {
             "connection": uuid,
-            "command": f"echo {encoded} | base64 -d > /tmp/.xp_rc"
+            "command": f"echo {encoded} | base64 -d > {rc_path}"
         }, token)
 
         # Stop shell session
         _api_post("/shell/stop", {"connection": uuid}, token)
+    else:
+        # shell/start failed — build rcfile with default dialect
+        rcfile = _build_rcfile(conn, prefs, shell_dialect)
+        encoded = base64.b64encode(rcfile.encode()).decode()
 
     # Launch via xpipe (handles auth) with custom rcfile
     name = conn["raw_name"]
-    os.execvp("xpipe", ["xpipe", "launch", name, "--", "bash", "--rcfile", "/tmp/.xp_rc"])
+    rc_path = f"/tmp/.xp_rc_{user}"
+    if shell_dialect in ("bash", "sh"):
+        os.execvp("xpipe", ["xpipe", "launch", name, "--", "bash", "--rcfile", rc_path])
+    elif shell_dialect == "zsh":
+        os.execvp("xpipe", ["xpipe", "launch", name, "--", "zsh", "-c", f"source {rc_path} && exec zsh"])
+    else:
+        # Fallback for unsupported dialects
+        os.execvp("xpipe", ["xpipe", "launch", name, "--", "bash", "--rcfile", rc_path])
 
 
 def main():
