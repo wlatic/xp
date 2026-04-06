@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""xp — Fuzzy SSH launcher powered by XPipe API
+
+Usage:
+    xp                      Show all SSH connections in a menu
+    xp <filter>             Fuzzy-match connections by name/host/category
+    xp <filter> <filter>    Multiple filters (AND — all must match)
+    xp --list               Print matching connections as JSON
+    xp --debug              Show API debug output
+
+API key: set XPIPE_API_KEY env var, or put key in ~/.config/xp/key
+Port: defaults to 21721, override with XPIPE_BEACON_PORT
+
+Single match auto-connects. Multiple matches show a filtered menu.
+Connects in current terminal with full XPipe environment (starship, init scripts).
+"""
+
+import base64
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+API_PORT = int(os.environ.get("XPIPE_BEACON_PORT", "21721"))
+API_BASE = f"http://localhost:{API_PORT}"
+DEBUG = False
+
+
+def _debug(msg):
+    if DEBUG:
+        print(f"  [DEBUG] {msg}", file=sys.stderr)
+
+
+def _load_api_key():
+    """Load API key from env var or config file."""
+    key = os.environ.get("XPIPE_API_KEY")
+    if key:
+        _debug("API key loaded from XPIPE_API_KEY env var")
+        return key.strip()
+
+    key_file = Path.home() / ".config" / "xp" / "key"
+    try:
+        key = key_file.read_text().strip()
+        if key:
+            _debug(f"API key loaded from {key_file}")
+            return key
+    except Exception:
+        pass
+
+    print("Error: No API key found.", file=sys.stderr)
+    print("Set XPIPE_API_KEY env var or put your key in ~/.config/xp/key", file=sys.stderr)
+    sys.exit(1)
+
+
+def _api_post(endpoint, data, token=None, timeout=10):
+    """POST to XPipe API. Returns parsed JSON or None on error."""
+    url = f"{API_BASE}{endpoint}"
+    body = json.dumps(data).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    _debug(f"POST {url}")
+    _debug(f"  body: {json.dumps(data)}")
+
+    req = urllib.request.Request(url, data=body, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp_body = resp.read().decode("utf-8")
+            _debug(f"  response: {resp_body}")
+            return json.loads(resp_body) if resp_body.strip() else {}
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8") if e.fp else ""
+        _debug(f"  HTTP {e.code}: {err_body}")
+        print(f"API error: HTTP {e.code} on {endpoint}", file=sys.stderr)
+        return None
+    except urllib.error.URLError as e:
+        _debug(f"  connection error: {e}")
+        print(f"Cannot reach XPipe API at {API_BASE} — is XPipe running?", file=sys.stderr)
+        sys.exit(1)
+
+
+def _handshake(api_key):
+    """Authenticate with XPipe API. Returns session token."""
+    data = {
+        "auth": {"type": "ApiKey", "key": api_key},
+        "client": {"type": "Api", "name": "xp"},
+    }
+    result = _api_post("/handshake", data)
+    if result and "sessionToken" in result:
+        _debug(f"  session token: {result['sessionToken'][:20]}...")
+        return result["sessionToken"]
+    print("Error: Handshake failed — check your API key.", file=sys.stderr)
+    sys.exit(1)
+
+
+def _query_ssh_connections(token):
+    """Get UUIDs of all SSH connections."""
+    data = {
+        "categoryFilter": "**",
+        "connectionFilter": "**",
+        "typeFilter": "ssh",
+    }
+    result = _api_post("/connection/query", data, token)
+    if result and "found" in result:
+        _debug(f"  found {len(result['found'])} SSH connections")
+        return result["found"]
+    return []
+
+
+def _get_connection_info(uuids, token):
+    """Fetch info for a list of connection UUIDs."""
+    if not uuids:
+        return []
+    data = {"connections": uuids}
+    result = _api_post("/connection/info", data, token)
+    if result and "infos" in result:
+        return result["infos"]
+    return []
+
+
+def _resolve_usernames(infos, token):
+    """Batch-resolve identity refs to usernames. Returns {identity_uuid: username}."""
+    identity_refs = set()
+    for info in infos:
+        raw = info.get("rawData", {})
+        identity = raw.get("identity", {})
+        if isinstance(identity, dict) and identity.get("type") == "ref":
+            ref = identity.get("ref")
+            if ref:
+                identity_refs.add(ref)
+
+    if not identity_refs:
+        return {}
+
+    _debug(f"Resolving {len(identity_refs)} identity refs")
+    identity_infos = _get_connection_info(list(identity_refs), token)
+
+    username_map = {}
+    for info in identity_infos:
+        uuid = info.get("connection")
+        raw = info.get("rawData", {})
+        username = raw.get("username") or raw.get("user")
+        if uuid and username:
+            username_map[uuid] = username
+
+    _debug(f"  resolved usernames: {username_map}")
+    return username_map
+
+
+def _build_connections(infos, username_map):
+    """Build connection dicts from API info responses."""
+    connections = []
+    for info in infos:
+        raw = info.get("rawData", {})
+        host = raw.get("host", "")
+        if not host:
+            continue
+
+        # Resolve username from identity ref
+        user = "?"
+        identity = raw.get("identity", {})
+        if isinstance(identity, dict) and identity.get("type") == "ref":
+            ref = identity.get("ref")
+            if ref:
+                user = username_map.get(ref, "?")
+
+        # Name comes as array, join and title-case
+        name_parts = info.get("name", [])
+        raw_name = " - ".join(name_parts) if name_parts else "Unknown"
+        name = raw_name.title()
+
+        # Category comes as array
+        cat_parts = info.get("category", [])
+        category = " / ".join(cat_parts) if cat_parts else "uncategorized"
+
+        port = raw.get("port", 22) or 22
+        state = info.get("state", {})
+        running = state.get("running", False)
+
+        connections.append({
+            "uuid": info.get("connection", ""),
+            "name": name,
+            "raw_name": raw_name,
+            "user": user,
+            "host": host,
+            "port": port,
+            "category": category,
+            "running": running,
+        })
+
+    return connections
+
+
+def _fuzzy_score(pattern, text):
+    pattern = pattern.lower()
+    text = text.lower()
+    if pattern in text:
+        pos = text.index(pattern)
+        score = 100 + len(pattern)
+        if pos == 0:
+            score += 50
+        elif text[pos - 1] in " -_.@":
+            score += 30
+        return score
+    p_idx = 0
+    score = 0
+    consecutive = 0
+    first_match = -1
+    last_match = -1
+    for t_idx, char in enumerate(text):
+        if p_idx < len(pattern) and char == pattern[p_idx]:
+            if first_match == -1:
+                first_match = t_idx
+            last_match = t_idx
+            if consecutive > 0:
+                score += consecutive * 3
+            consecutive += 1
+            if t_idx == 0 or text[t_idx - 1] in " -_.@":
+                score += 10
+            p_idx += 1
+            score += 1
+        else:
+            consecutive = 0
+    if p_idx < len(pattern):
+        return 0
+    spread = last_match - first_match + 1
+    if spread > 0:
+        score += max(0, 20 - spread)
+    return score
+
+
+def _match_connection(filters, conn):
+    searchable = f"{conn['name']} {conn['user']}@{conn['host']} {conn['category']}"
+    total = 0
+    for filt in filters:
+        score = _fuzzy_score(filt, searchable)
+        if score == 0:
+            return 0
+        total += score
+    return total
+
+
+def _parse_args():
+    filters = []
+    flags = set()
+    for arg in sys.argv[1:]:
+        if arg.startswith("--"):
+            flags.add(arg)
+        else:
+            filters.append(arg)
+    return filters, flags
+
+
+def _build_ordered(connections):
+    """Build flat list in menu display order (grouped by category, sorted by name)."""
+    groups = {}
+    for conn in connections:
+        groups.setdefault(conn["category"], []).append(conn)
+    ordered = []
+    for cat in sorted(groups):
+        for conn in sorted(groups[cat], key=lambda c: c["name"].lower()):
+            ordered.append(conn)
+    return ordered
+
+
+def _display_menu(connections):
+    """Print grouped, numbered menu with status indicators."""
+    if not connections:
+        print("No SSH connections found.")
+        return
+
+    groups = {}
+    for conn in connections:
+        groups.setdefault(conn["category"], []).append(conn)
+
+    # Calculate column widths
+    all_conns = _build_ordered(connections)
+    max_name = max(len(c["name"]) for c in all_conns)
+    max_detail = max(len(f"{c['user']}@{c['host']}" + (f":{c['port']}" if c["port"] != 22 else "")) for c in all_conns)
+
+    print("\n=== SSH Connections ===\n")
+    idx = 1
+    for cat in sorted(groups):
+        print(f" [{cat}]")
+        for conn in sorted(groups[cat], key=lambda c: c["name"].lower()):
+            port_str = f":{conn['port']}" if conn["port"] != 22 else ""
+            detail = f"{conn['user']}@{conn['host']}{port_str}"
+            status = "\033[32m\u25cf\033[0m running" if conn["running"] else "\033[90m\u25cb\033[0m stopped"
+            print(f"  {idx:>2}) {conn['name']:<{max_name}s}  {detail:<{max_detail}s}  {status}")
+            idx += 1
+        print()
+
+
+def _load_xpipe_prefs():
+    """Load XPipe preferences from local config file."""
+    prefs_file = Path.home() / ".xpipe" / "settings" / "preferences.json"
+    try:
+        with open(prefs_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        _debug(f"Could not read XPipe preferences: {e}")
+        return {}
+
+
+def _build_rcfile(conn, prefs):
+    """Build shell rcfile content from XPipe preferences."""
+    user = conn["user"]
+    lines = []
+
+    # Source the user's bashrc first
+    lines.append('[ -f ~/.bashrc ] && source ~/.bashrc')
+
+    # Clear terminal if XPipe has that enabled
+    if prefs.get("clearTerminalOnInit", False):
+        lines.append('clear')
+
+    # Prompt tool setup
+    prompt = prefs.get("terminalPrompt")
+    if prompt:
+        prompt_type = prompt.get("type")
+        config_text = prompt.get("configuration")
+
+        if prompt_type == "starship":
+            bin_dir = f"/tmp/xpipe/{user}/bin/starship"
+            config_path = f"/tmp/xpipe/{user}/prompt/starship/starship.toml"
+            lines.append(f'export PATH="{bin_dir}:$PATH"')
+            if config_text:
+                lines.append(f'export STARSHIP_CONFIG="{config_path}"')
+            lines.append('if command -v starship > /dev/null 2>&1; then')
+            lines.append('    eval "$(starship init bash)"')
+            lines.append('fi')
+
+        elif prompt_type == "ohmyposh":
+            bin_dir = f"/tmp/xpipe/{user}/bin/oh-my-posh"
+            config_path = f"/tmp/xpipe/{user}/prompt/ohmyposh/config.json"
+            lines.append(f'export PATH="{bin_dir}:$PATH"')
+            lines.append('if command -v oh-my-posh > /dev/null 2>&1; then')
+            if config_text:
+                lines.append(f'    eval "$(oh-my-posh init bash --config {config_path})"')
+            else:
+                lines.append('    eval "$(oh-my-posh init bash)"')
+            lines.append('fi')
+
+    # Terminal init script from XPipe settings
+    init_script = prefs.get("terminalInitScript")
+    if init_script:
+        lines.append(f'# XPipe terminal init script')
+        lines.append(init_script)
+
+    # Set terminal title to connection name
+    lines.append(f'printf "\\033]0;{conn["name"]}\\007"')
+
+    return '\n'.join(lines) + '\n'
+
+
+def _launch_connection(conn, token):
+    """Launch SSH via XPipe with full terminal init from XPipe preferences."""
+    print(f"\nConnecting to {conn['name']} ({conn['user']}@{conn['host']})...")
+
+    uuid = conn["uuid"]
+    user = conn["user"]
+    prefs = _load_xpipe_prefs()
+
+    # Build rcfile from XPipe preferences
+    rcfile = _build_rcfile(conn, prefs)
+    encoded = base64.b64encode(rcfile.encode()).decode()
+
+    # Start shell session to prepare remote
+    _debug("Starting shell session on remote")
+    result = _api_post("/shell/start", {"connection": uuid}, token)
+    if result is not None:
+        # Ensure prompt tool binary exists
+        prompt = prefs.get("terminalPrompt")
+        if prompt:
+            prompt_type = prompt.get("type")
+            config_text = prompt.get("configuration")
+
+            if prompt_type == "starship":
+                bin_dir = f"/tmp/xpipe/{user}/bin/starship"
+                config_dir = f"/tmp/xpipe/{user}/prompt/starship"
+                starship_bin = f"{bin_dir}/starship"
+
+                # Check and install starship if needed
+                check = _api_post("/shell/exec", {
+                    "connection": uuid,
+                    "command": f"test -x {starship_bin} && echo EXISTS || echo MISSING"
+                }, token)
+                stdout = (check or {}).get("stdout", "").strip()
+                _debug(f"Starship check: {stdout!r}")
+
+                if stdout != "EXISTS":
+                    print(f"  Installing starship on {conn['name']}...")
+                    _api_post("/shell/exec", {
+                        "connection": uuid,
+                        "command": f'mkdir -p "{bin_dir}" && curl -sS https://starship.rs/install.sh | sh /dev/stdin -y --bin-dir "{bin_dir}"'
+                    }, token, timeout=120)
+
+                # Write starship config if present
+                if config_text:
+                    config_encoded = base64.b64encode(config_text.encode()).decode()
+                    _api_post("/shell/exec", {
+                        "connection": uuid,
+                        "command": f'mkdir -p "{config_dir}" && echo {config_encoded} | base64 -d > {config_dir}/starship.toml'
+                    }, token)
+
+            elif prompt_type == "ohmyposh":
+                bin_dir = f"/tmp/xpipe/{user}/bin/oh-my-posh"
+                config_dir = f"/tmp/xpipe/{user}/prompt/ohmyposh"
+                omp_bin = f"{bin_dir}/oh-my-posh"
+
+                check = _api_post("/shell/exec", {
+                    "connection": uuid,
+                    "command": f"test -x {omp_bin} && echo EXISTS || echo MISSING"
+                }, token)
+                stdout = (check or {}).get("stdout", "").strip()
+                _debug(f"Oh My Posh check: {stdout!r}")
+
+                if stdout != "EXISTS":
+                    print(f"  Installing Oh My Posh on {conn['name']}...")
+                    _api_post("/shell/exec", {
+                        "connection": uuid,
+                        "command": f'mkdir -p "{bin_dir}" && curl -s https://ohmyposh.dev/install.sh | bash -s -- -d "{bin_dir}"'
+                    }, token, timeout=120)
+
+                if config_text:
+                    config_encoded = base64.b64encode(config_text.encode()).decode()
+                    _api_post("/shell/exec", {
+                        "connection": uuid,
+                        "command": f'mkdir -p "{config_dir}" && echo {config_encoded} | base64 -d > {config_dir}/config.json'
+                    }, token)
+
+        # Query enabled init scripts from XPipe
+        _debug("Checking for enabled init scripts")
+        script_uuids = []
+        scripts_query = _api_post("/connection/query", {
+            "categoryFilter": "**",
+            "connectionFilter": "**",
+            "typeFilter": "script"
+        }, token)
+        if scripts_query and "found" in scripts_query:
+            script_uuids = scripts_query["found"]
+
+        if script_uuids:
+            script_infos = _api_post("/connection/info", {"connections": script_uuids}, token)
+            if script_infos and "infos" in script_infos:
+                for info in script_infos["infos"]:
+                    state = info.get("state", {})
+                    if not state.get("enabled", False):
+                        continue
+                    raw = info.get("rawData", {})
+                    if not raw.get("initScript", False):
+                        continue
+                    text_source = raw.get("textSource", {})
+                    if text_source.get("type") == "inPlace":
+                        script_text = text_source.get("text", "")
+                        if script_text:
+                            _debug(f"Adding init script: {info.get('name', ['unknown'])}")
+                            # Append to rcfile
+                            rcfile += f"\n# XPipe script: {' '.join(info.get('name', []))}\n{script_text}\n"
+                            encoded = base64.b64encode(rcfile.encode()).decode()
+
+        # Write rcfile to remote
+        _debug("Writing rcfile to remote")
+        _api_post("/shell/exec", {
+            "connection": uuid,
+            "command": f"echo {encoded} | base64 -d > /tmp/.xp_rc"
+        }, token)
+
+        # Stop shell session
+        _api_post("/shell/stop", {"connection": uuid}, token)
+
+    # Launch via xpipe (handles auth) with custom rcfile
+    name = conn["raw_name"]
+    os.execvp("xpipe", ["xpipe", "launch", name, "--", "bash", "--rcfile", "/tmp/.xp_rc"])
+
+
+def main():
+    global DEBUG
+    filters, flags = _parse_args()
+    DEBUG = "--debug" in flags
+
+    # Load API key and authenticate
+    api_key = _load_api_key()
+    token = _handshake(api_key)
+
+    # Query all SSH connections
+    uuids = _query_ssh_connections(token)
+    if not uuids:
+        print("No SSH connections found in XPipe.")
+        sys.exit(1)
+
+    # Get connection details
+    infos = _get_connection_info(uuids, token)
+    if not infos:
+        print("No connection info returned from API.")
+        sys.exit(1)
+
+    # Resolve usernames from identity refs
+    username_map = _resolve_usernames(infos, token)
+
+    # Build connection list
+    connections = _build_connections(infos, username_map)
+    if not connections:
+        print("No valid SSH connections found.")
+        sys.exit(1)
+
+    # Apply fuzzy filters
+    if filters:
+        scored = []
+        for conn in connections:
+            score = _match_connection(filters, conn)
+            if score > 0:
+                scored.append((score, conn))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        connections = [conn for _, conn in scored]
+
+        if not connections:
+            print(f"No connections matching: {' '.join(filters)}")
+            sys.exit(1)
+
+    # --list: JSON output
+    if "--list" in flags:
+        output = []
+        for conn in connections:
+            output.append({
+                "name": conn["name"],
+                "user": conn["user"],
+                "host": conn["host"],
+                "port": conn["port"],
+                "category": conn["category"],
+                "running": conn["running"],
+            })
+        print(json.dumps(output, indent=2))
+        sys.exit(0)
+
+    # Auto-connect on single match with filters
+    if filters and len(connections) == 1:
+        _launch_connection(connections[0], token)
+        sys.exit(0)
+
+    # Show menu and prompt
+    ordered = _build_ordered(connections)
+    _display_menu(connections)
+
+    while True:
+        try:
+            choice = input(f"Select (1-{len(ordered)}) or q to quit: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(0)
+
+        if choice.lower() == "q":
+            sys.exit(0)
+
+        try:
+            num = int(choice)
+        except ValueError:
+            print("Invalid input.")
+            continue
+
+        if 1 <= num <= len(ordered):
+            _launch_connection(ordered[num - 1], token)
+            break
+        else:
+            print(f"Please enter a number between 1 and {len(ordered)}.")
+
+
+if __name__ == "__main__":
+    main()
