@@ -61,6 +61,64 @@ $ xp ai         # Single match → auto-connects immediately
 - [XPipe](https://xpipe.io) with the API enabled (Settings > API)
 - XPipe API key (Settings > API)
 
+## Running XPipe without the GUI
+
+`xp` only needs the XPipe daemon — the GUI is not required. This makes it perfect for headless workflows.
+
+### Check daemon status
+
+```bash
+xpipe daemon status
+```
+
+### Start the daemon manually
+
+```bash
+xpipe daemon start
+```
+
+### Run as a background service (auto-start on login)
+
+Set XPipe's startup mode to background daemon:
+
+```bash
+xpipe daemon mode background
+```
+
+Or create a systemd user service (Linux):
+
+```bash
+mkdir -p ~/.config/systemd/user
+
+cat > ~/.config/systemd/user/xpipe-daemon.service << 'XPEOF'
+[Unit]
+Description=XPipe Daemon
+After=network.target
+
+[Service]
+ExecStart=xpipe daemon start
+ExecStop=xpipe daemon stop
+Restart=on-failure
+Type=simple
+
+[Install]
+WantedBy=default.target
+XPEOF
+
+systemctl --user daemon-reload
+systemctl --user enable --now xpipe-daemon
+```
+
+### Workflow
+
+With the daemon running headlessly, your workflow becomes:
+
+1. Open a terminal tab
+2. Run `xp` (or `xp <filter>`)
+3. Pick a server → you're connected with full environment
+
+No XPipe windows, no GUI, no clicking — just fast SSH with all your XPipe-managed auth and terminal customizations.
+
 ## Install
 
 ### Linux / macOS
