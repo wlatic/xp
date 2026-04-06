@@ -16,7 +16,7 @@ $ xp
   3) Proxmox 2 - Host      root@10.10.5.10     ● running
 
  [external]
-  4) Http Node - External   root@167.253.65.72  ● running
+  4) Http Node - External   root@167.*  ● running
 
 Select (1-4) or q to quit:
 ```
