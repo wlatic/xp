@@ -331,6 +331,9 @@ def _build_rcfile(conn, prefs, shell_dialect="bash"):
     elif shell_dialect == "zsh":
         lines.append('[ -f ~/.zshrc ] && source ~/.zshrc')
 
+    # Set TERM to xterm-ghostty if terminfo is available
+    lines.append('infocmp xterm-ghostty > /dev/null 2>&1 && export TERM=xterm-ghostty')
+
     # Clear terminal if XPipe has that enabled
     if prefs.get("clearTerminalOnInit", False):
         lines.append('clear')
