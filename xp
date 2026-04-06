@@ -18,6 +18,7 @@ Connects in current terminal with full XPipe environment (starship, init scripts
 import base64
 import json
 import os
+import subprocess
 import sys
 import urllib.request
 import urllib.error
@@ -465,6 +466,34 @@ def _launch_connection(conn, token):
                         "connection": uuid,
                         "command": f'mkdir -p "{config_dir}" && echo {config_encoded} | base64 -d > {config_dir}/config.json'
                     }, token)
+
+
+        # Ensure Ghostty terminfo is available on remote
+        _debug("Checking Ghostty terminfo")
+        check = _api_post("/shell/exec", {
+            "connection": uuid,
+            "command": "infocmp xterm-ghostty > /dev/null 2>&1 && echo EXISTS || echo MISSING"
+        }, token)
+        stdout = (check or {}).get("stdout", "").strip()
+        _debug(f"Ghostty terminfo check: {stdout!r}")
+        if stdout != "EXISTS":
+            _debug("Installing Ghostty terminfo on remote")
+            # Get the terminfo from the local machine and install it on the remote
+            # This is done via shell/exec using a base64-encoded terminfo
+            try:
+                result_local = subprocess.run(
+                    ["infocmp", "-x", "xterm-ghostty"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result_local.returncode == 0 and result_local.stdout:
+                    terminfo_encoded = base64.b64encode(result_local.stdout.encode()).decode()
+                    _api_post("/shell/exec", {
+                        "connection": uuid,
+                        "command": f"echo {terminfo_encoded} | base64 -d | tic -x -"
+                    }, token, timeout=30)
+                    _debug("Ghostty terminfo installed")
+            except Exception as e:
+                _debug(f"Could not install Ghostty terminfo: {e}")
 
         # Query enabled init scripts from XPipe
         _debug("Checking for enabled init scripts")

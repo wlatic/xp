@@ -37,6 +37,7 @@ $ xp ai         # Single match → auto-connects immediately
 - **Shell dialect detection** — detects remote shell (bash, zsh, fish) and adapts init commands
 - **Init scripts** — XPipe-enabled init scripts are injected into the session
 - **Terminal title** — set to the connection name
+- **Ghostty terminfo** — auto-installs `xterm-ghostty` terminfo on remotes that don't have it
 - **Status indicators** — shows which servers are running/stopped
 - **JSON output** — `xp --list` for scripting
 - **Cross-platform** — works on Linux, macOS, and Windows (reads platform-specific XPipe paths)
@@ -52,6 +53,7 @@ $ xp ai         # Single match → auto-connects immediately
    - Detects remote shell dialect (bash/zsh/fish)
    - Installs starship or Oh My Posh if missing
    - Deploys prompt config (TOML/JSON)
+   - Installs Ghostty terminfo if missing
    - Writes a custom rcfile with all init commands
 6. Launches via `xpipe launch` with the rcfile for full environment
 
