@@ -65,6 +65,17 @@ $ xp ai         # Single match → auto-connects immediately
 
 ## Running XPipe without the GUI
 
+> **Important:** By default, XPipe's close behavior is set to "Quit" — which means if you ever open the GUI and close it, the daemon dies too and `xp` stops working. Change this in XPipe GUI → Settings → General:
+>
+> - **Startup Behavior** → "Start in background"
+> - **Close Behavior** → "Continue in background"
+>
+> Or set in `~/.xpipe/settings/preferences.json`:
+> ```json
+> "startupBehaviour": "app.startInBackground",
+> "closeBehaviour": "app.continueInBackground"
+> ```
+
 `xp` only needs the XPipe daemon — the GUI is not required. This makes it perfect for headless workflows.
 
 ### Check daemon status
