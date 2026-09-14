@@ -73,7 +73,7 @@ xp --setup                 # configure/reconfigure URL and key, requiring an ini
 
 A failed automatic refresh prints a short notice and uses the previous copy. An explicit `--sync` fails instead of reporting stale data as refreshed. New or changed credentials only become available offline after a successful refresh. Successful sync also applies removals made on the website. Interrupted, malformed, incomplete, or overlapping refreshes preserve the previous usable copy.
 
-The picker hides hosts with disabled terminals or missing credentials. It supports direct SSH with saved passwords and private keys, including encrypted keys with saved or interactively entered passphrases. Saved credential usernames follow Termix's host override rules.
+The picker hides hosts with SSH explicitly disabled or missing credentials. The web terminal button and old "Needs credentials" names or tags do not control native SSH eligibility. It supports direct SSH with saved passwords and private keys, including encrypted keys with saved or interactively entered passphrases. Saved credential usernames follow Termix's host override rules.
 
 OpenSSH verifies server host keys normally. The first connection asks you to verify/accept the host fingerprint; changed host keys are rejected. Existing OpenSSH `known_hosts` is used. SSH configuration from your normal OpenSSH files still applies. The wrapper selects the exported host, port, username and saved authentication explicitly.
 

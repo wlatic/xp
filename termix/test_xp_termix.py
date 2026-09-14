@@ -70,6 +70,20 @@ class NativeTests(unittest.TestCase):
         creds[0]['certPublicKey'] = 'CERT'
         self.assertTrue(xp.resolve_rows(hosts, creds)[0]['unavailable_reason'])
 
+    def test_ssh_eligibility_uses_credentials_not_ui_or_old_labels(self):
+        hosts, creds = self.fixture()
+        hosts[0].update(enableSsh=True, enableTerminal=False,
+                        name='External [Needs credentials]', tags=['Needs credentials'])
+        creds[0].update(authType='key', password=None, key='PRIVATE-KEY')
+        self.assertFalse(xp.resolve_rows(hosts, creds)[0]['unavailable_reason'])
+
+        hosts[0]['enableSsh'] = False
+        self.assertEqual(xp.resolve_rows(hosts, creds)[0]['unavailable_reason'], 'SSH disabled')
+
+        hosts[0]['enableSsh'] = True
+        creds[0]['key'] = None
+        self.assertEqual(xp.resolve_rows(hosts, creds)[0]['unavailable_reason'], 'Needs credentials')
+
     def test_safe_json_filters_and_terminal_labels(self):
         hosts, creds = self.fixture()
         hosts[0]['name'] = '\x1b[31mDocker\nspoof'

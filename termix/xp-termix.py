@@ -216,8 +216,8 @@ def normalize_hosts(payload):
         ip, user = host['ip'], host['username']
         if row.get('connectionType', 'ssh') != 'ssh':
             reason = 'Not SSH'
-        elif row.get('enableSsh') is False or row.get('enableTerminal') is not True:
-            reason = 'Terminal disabled'
+        elif row.get('enableSsh') is False:
+            reason = 'SSH disabled'
         elif not isinstance(ip, str) or not re.fullmatch(r'[A-Za-z0-9._:%-]+', ip) or ip.startswith('-') or ip == '0.0.0.0':
             reason = 'Missing or unsupported address'
         elif not isinstance(user, str) or not re.fullmatch(r'[A-Za-z0-9._@-]+', user) or user.startswith('-'):
@@ -233,8 +233,6 @@ def normalize_hosts(payload):
         elif host['authType'] not in ('password', 'key', 'credential'):
             reason = 'Unsupported authentication method'
         elif not host['key'] and not host['password']:
-            reason = 'Needs credentials'
-        elif 'needs credentials' in (host['name'] + ' ' + ' '.join(host['tags'])).lower():
             reason = 'Needs credentials'
         host['unavailable_reason'] = reason
         hosts.append(host)
