@@ -2,6 +2,8 @@
 """Native SSH picker with an encrypted, one-way Termix cache. No desktop app required."""
 import argparse
 import base64
+from datetime import datetime, timezone
+import math
 import getpass
 import fcntl
 import hashlib
@@ -25,6 +27,7 @@ import urllib.request
 
 SERVICE = 'xp-termix'
 MAX_BYTES = 16 * 1024 * 1024
+CASCADE_TIMEOUT = 5.0
 
 
 class Error(Exception):
@@ -75,6 +78,10 @@ def read_config():
         validate_url(cfg['url'])
         if not isinstance(cfg['account'], str) or not re.fullmatch('[a-f0-9]{32}', cfg['account']):
             raise ValueError()
+        if 'servers' in cfg:
+            validate_servers(cfg['servers'])
+            if not isinstance(cfg.get('owner_id'), str) or not cfg['owner_id']:
+                raise ValueError()
         return cfg
     except (OSError, ValueError, KeyError, TypeError):
         raise Error('Run xp-termix --setup first.') from None
@@ -176,6 +183,132 @@ def download(url, api_key):
     return hosts
 
 
+
+def validate_servers(servers):
+    if not isinstance(servers, list) or len(servers) != 2 or any(not isinstance(url, str) for url in servers):
+        raise Error('Configure exactly two HTTPS server origins: primary then standby.')
+    urls = [validate_url(url) for url in servers]
+    if len(set(urls)) != 2 or any(urllib.parse.urlsplit(url).path not in ('', '/') for url in urls):
+        raise Error('Primary and standby must be distinct HTTPS origins without URL paths.')
+    return urls
+
+
+def request_json(url, api_key, path, deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise Error('Server attempt timed out.')
+    request = urllib.request.Request(url + path, headers={'Authorization': 'Bearer ' + api_key, 'Accept': 'application/json'})
+    opener = urllib.request.build_opener(NoRedirect())
+    with opener.open(request, timeout=remaining) as response:
+        raw = response.read(MAX_BYTES + 1)
+        headers = {name.lower(): value for name, value in response.headers.items()}
+    if len(raw) > MAX_BYTES:
+        raise Error('Termix response exceeds the supported size.')
+    return json.loads(raw), headers
+
+
+def bounded_result(work, timeout):
+    results = queue.Queue(maxsize=1)
+    def run():
+        try:
+            results.put((work(), None))
+        except Error as exc:
+            results.put((None, exc))
+        except Exception:
+            results.put((None, Error('Termix server unavailable or returned invalid data.')))
+    threading.Thread(target=run, daemon=True).start()
+    try:
+        result, error = results.get(timeout=max(0, timeout))
+    except queue.Empty:
+        raise Error('Termix server attempt timed out.') from None
+    if error:
+        raise error
+    return result
+
+
+def response_owner(payload):
+    if not isinstance(payload, dict) or not isinstance(payload.get('userId'), str) or not payload['userId']:
+        raise Error('Termix did not identify the authenticated account.')
+    return payload['userId']
+
+
+def standby_generation(headers, now):
+    stamp = headers.get('x-termix-snapshot-time')
+    digest = headers.get('x-termix-snapshot-sha256')
+    try:
+        parsed = datetime.fromisoformat(stamp.replace('Z', '+00:00'))
+        if parsed.tzinfo is None or not re.fullmatch('[a-f0-9]{64}', digest or ''):
+            raise ValueError()
+        value = parsed.timestamp()
+        if not math.isfinite(value) or value <= 0 or value > now + 30:
+            raise ValueError()
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        raise Error('Standby lacks a valid verified snapshot time and hash.') from None
+    return value, digest
+
+
+def download_candidate(url, api_key, owner_id, *, standby=False, timeout=5):
+    deadline, started = time.monotonic() + timeout, time.time()
+    def fetch():
+        me, owner_headers = request_json(url, api_key, '/users/me', deadline)
+        owner = response_owner(me)
+        if owner_id and owner != owner_id:
+            raise Error('Termix account identity differs from the configured primary.')
+        rows = []
+        generations = [standby_generation(owner_headers, started)] if standby else []
+        for table in ('hosts', 'sshCredentials'):
+            payload, headers = request_json(url, api_key, '/sync/' + table, deadline)
+            if not isinstance(payload, dict) or not isinstance(payload.get('rows'), list):
+                raise Error('Incomplete Termix inventory; previous cache preserved.')
+            if any(not isinstance(row, dict) or row.get('userId') != owner for row in payload['rows']):
+                raise Error('Termix inventory contains a different account identity.')
+            if standby:
+                generations.append(standby_generation(headers, started))
+            rows.append(payload['rows'])
+        if standby and len(set(generations)) != 1:
+            raise Error('Standby changed snapshot during refresh; previous cache preserved.')
+        metadata = {'source': url, 'data_time': generations[0][0] if standby else started, 'owner_id': owner}
+        if standby:
+            metadata['snapshot_sha256'] = generations[0][1]
+        return resolve_rows(*rows), metadata
+    return bounded_result(fetch, timeout)
+
+
+def download_servers(cfg, api_key, cached):
+    deadline = time.monotonic() + CASCADE_TIMEOUT
+    errors = []
+    for index, url in enumerate(cfg['servers']):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        budget = min(CASCADE_TIMEOUT / 2, remaining) if index == 0 else remaining
+        try:
+            hosts, metadata = download_candidate(url, api_key, cfg['owner_id'], standby=index > 0, timeout=budget)
+            previous_time = cached.get('data_time', cached['updated_at']) if cached else 0
+            if index > 0 and metadata['data_time'] < previous_time:
+                raise Error('Standby snapshot is older than the existing encrypted cache.')
+            return hosts, metadata
+        except Error as exc:
+            errors.append(str(exc))
+    raise Error(errors[-1] if errors else 'Termix refresh exceeded the five-second total deadline.')
+
+
+def configure_servers(cfg, api_key, servers):
+    urls = validate_servers(servers)
+    expected = cfg.get('owner_id')
+    if not expected and cfg['url'] != urls[0]:
+        deadline = time.monotonic() + 2.5
+        try:
+            expected = bounded_result(lambda: response_owner(request_json(cfg['url'], api_key, '/users/me', deadline)[0]), 2.5)
+        except Error:
+            pass  # Explicit user-selected URLs permit first trust if old source is down.
+    _, metadata = download_candidate(urls[0], api_key, expected, timeout=CASCADE_TIMEOUT)
+    updated = dict(cfg, servers=urls, owner_id=metadata['owner_id'])
+    # Keep legacy url/AAD, account, keyring and encrypted cache byte-for-byte.
+    atomic_write(paths()[0] / 'config.json', json.dumps(updated).encode())
+    print('Server order saved: primary, standby, then encrypted cache. Credentials and cached data preserved.')
+
+
 def clean(value):
     return ''.join(c if c.isprintable() else ' ' for c in str(value or ''))
 
@@ -239,9 +372,11 @@ def normalize_hosts(payload):
     return hosts
 
 
-def save_cache(cfg, key, hosts):
+def save_cache(cfg, key, hosts, metadata=None):
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     snapshot = {'version': 1, 'updated_at': time.time(), 'hosts': hosts}
+    if metadata:
+        snapshot.update(metadata)
     nonce = secrets.token_bytes(12)
     payload = json.dumps(snapshot).encode()
     sealed = nonce + AESGCM(key).encrypt(nonce, payload, cfg['url'].encode())
@@ -259,6 +394,8 @@ def read_cache(cfg, key):
         decoded = AESGCM(key).decrypt(sealed[:12], sealed[12:], cfg['url'].encode())
         snapshot = json.loads(decoded)
         if snapshot['version'] != 1 or not isinstance(snapshot['hosts'], list) or not isinstance(snapshot['updated_at'], (int, float)):
+            raise ValueError()
+        if 'data_time' in snapshot and (not isinstance(snapshot['data_time'], (int, float)) or not math.isfinite(snapshot['data_time'])):
             raise ValueError()
         return snapshot
     except Exception:
@@ -321,6 +458,9 @@ def _inventory(cfg, api_key, key, *, offline=False, force=False):
         cached = None
     if not offline:  # User preference: attempt refresh before every connection.
         try:
+            if cfg.get('servers'):
+                hosts, metadata = download_servers(cfg, api_key, cached)
+                return save_cache(cfg, key, hosts, metadata)
             return save_cache(cfg, key, download(cfg['url'], api_key))
         except (Error, OSError) as exc:
             if force or not cached:
@@ -491,6 +631,7 @@ def main(argv=None):
     parser.add_argument('filters', nargs='*')
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--setup', action='store_true')
+    group.add_argument('--servers', nargs=2, metavar=('PRIMARY', 'STANDBY'), help='Update HTTPS server order without replacing credentials or cache')
     group.add_argument('--sync', action='store_true', help='Refresh encrypted local cache and exit')
     group.add_argument('--offline', action='store_true', help='Use cache without contacting Termix')
     parser.add_argument('--list', action='store_true', help='Safe JSON inventory, no secrets')
@@ -502,6 +643,9 @@ def main(argv=None):
         return 0
     cfg = read_config()
     api_key, key = load_secrets(cfg)
+    if args.servers:
+        configure_servers(cfg, api_key, args.servers)
+        return 0
     snapshot = inventory(cfg, api_key, key, offline=args.offline, force=args.sync)
     hosts = snapshot['hosts']
     if args.check or args.sync:

@@ -79,6 +79,38 @@ OpenSSH verifies server host keys normally. The first connection asks you to ver
 
 Your normal remote shell startup files and commands such as `ai` continue to work. XPipe-only prompt customization, injected init scripts and temporary starship installations are not copied or executed. Termix desktop session recordings, Docker/Proxmox consoles, file-manager actions, shared-host overrides, SSH certificates, Warpgate/Vault/OPKSSH, SOCKS, jump hosts, forced keyboard-interactive authentication and port knocking are outside this adapter's scope. Unsupported transports/authentication are marked unavailable rather than silently bypassed.
 
+## Optional primary and standby servers
+
+After updating with `python3 termix/install.py --activate`, existing users can set
+an ordered server pair without repeating setup or entering another API key:
+
+```sh
+xp --servers https://termix-primary.example.com https://termix-standby.example.com
+```
+
+This requires the standby to be a verified full-data clone of the primary, including
+the existing API key and owner identity. It is not for two unrelated Termix accounts.
+The primary must be reachable for this configuration step; the standby can remain
+cold. The command verifies a complete primary inventory and authenticated account,
+compares the previous account when known/reachable, then changes only the server
+configuration. The original encryption identity, keyring entries and cached data
+remain intact. Installation and endpoint changes are performed by you locally.
+
+Every normal `xp` invocation then tries the primary, the standby, and finally its
+existing encrypted cache. Both network attempts share a five-second total deadline:
+the primary receives up to 2.5 seconds, and the standby receives the remaining time.
+Hosts and credentials always come from a complete response pair on the same server;
+account identity is checked even for an empty inventory. A failed, partial or
+unauthorized response cannot overwrite the cache. `--offline` skips both servers;
+`--sync` reports failure when neither provides a usable refresh.
+
+The standby gate must attach identical `X-Termix-Snapshot-Time` and
+`X-Termix-Snapshot-SHA256` headers to its account and inventory responses. Missing,
+inconsistent or implausibly future snapshot metadata is rejected. An older standby
+snapshot never replaces a newer client cache: ordinary connections keep that newer
+copy, while explicit `--sync` reports the stale snapshot instead of claiming success.
+Existing single-server configurations continue working without these headers.
+
 ## Daily sync and local security
 
 ```bash
