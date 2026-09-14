@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -308,6 +309,38 @@ class CascadeTests(unittest.TestCase):
         for stamp in (xp.datetime.fromtimestamp(time.time()+3600,xp.timezone.utc).isoformat(),'2020-01-01T00:00:00','invalid'):
             with self.assertRaises(xp.Error):
                 xp.standby_generation({'x-termix-snapshot-time':stamp,'x-termix-snapshot-sha256':'a'*64},time.time())
+
+    def test_candidate_reads_overlap_and_keep_shared_origin_deadline(self):
+        barrier = threading.Barrier(3)
+        calls = []
+        base = self.responses()
+        def simultaneous(url, key, path, deadline):
+            calls.append((url, deadline))
+            barrier.wait(timeout=0.5)
+            return base(url, key, path, deadline)
+        with patch.object(xp, 'request_json', side_effect=simultaneous):
+            hosts, metadata = xp.download_candidate('https://standby.invalid', 'SECRET', 'fixture-owner', standby=True, timeout=1)
+        self.assertEqual(len(hosts), 2)
+        self.assertEqual(len(set(calls)), 1)
+        self.assertEqual(metadata['snapshot_sha256'], 'a'*64)
+
+    def test_candidate_partial_error_returns_without_waiting_for_stalled_sibling(self):
+        release = threading.Event()
+        base = self.responses()
+        def partial(url, key, path, deadline):
+            if path.endswith('sshCredentials'):
+                raise xp.Error('credential read failed')
+            release.wait(timeout=1)
+            return base(url, key, path, deadline)
+        try:
+            with patch.object(xp, 'request_json', side_effect=partial), patch.object(xp, 'save_cache') as save:
+                started = time.monotonic()
+                with self.assertRaisesRegex(xp.Error, 'credential read failed'):
+                    xp.download_candidate('https://primary.invalid', 'SECRET', 'fixture-owner', timeout=0.2)
+                self.assertLess(time.monotonic()-started, 0.3)
+                save.assert_not_called()
+        finally:
+            release.set()
 
     def test_total_budget_and_late_workers_cannot_promote(self):
         def stalled(*args):

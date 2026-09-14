@@ -250,14 +250,33 @@ def standby_generation(headers, now):
 def download_candidate(url, api_key, owner_id, *, standby=False, timeout=5):
     deadline, started = time.monotonic() + timeout, time.time()
     def fetch():
-        me, owner_headers = request_json(url, api_key, '/users/me', deadline)
+        # Independent reads share one origin/deadline. Daemon workers cannot
+        # promote data, and a stalled TLS/DNS request cannot delay shutdown.
+        results = queue.Queue(maxsize=3)
+        paths = ('/users/me', '/sync/hosts', '/sync/sshCredentials')
+        def read(index, path):
+            try:
+                results.put((index, request_json(url, api_key, path, deadline), None))
+            except Exception as exc:
+                results.put((index, None, exc))
+        for index, path in enumerate(paths):
+            threading.Thread(target=read, args=(index, path), daemon=True).start()
+        responses = [None] * len(paths)
+        for _ in paths:
+            try:
+                index, response, error = results.get(timeout=max(0, deadline-time.monotonic()))
+            except queue.Empty:
+                raise Error('Termix server attempt timed out.') from None
+            if error:
+                raise error
+            responses[index] = response
+        me, owner_headers = responses[0]
         owner = response_owner(me)
         if owner_id and owner != owner_id:
             raise Error('Termix account identity differs from the configured primary.')
         rows = []
         generations = [standby_generation(owner_headers, started)] if standby else []
-        for table in ('hosts', 'sshCredentials'):
-            payload, headers = request_json(url, api_key, '/sync/' + table, deadline)
+        for payload, headers in responses[1:]:
             if not isinstance(payload, dict) or not isinstance(payload.get('rows'), list):
                 raise Error('Incomplete Termix inventory; previous cache preserved.')
             if any(not isinstance(row, dict) or row.get('userId') != owner for row in payload['rows']):
