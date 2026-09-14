@@ -1,14 +1,40 @@
-# xp with Termix sync and native SSH
+# xp with Termix sync and remote SSH fallback
 
-Manage hosts and credentials on the Termix website, then type `xp` in Ghostty on Linux. Connections use your computer's OpenSSH client. Neither the Termix desktop app nor the official Termix CLI needs to run or be installed.
+Manage hosts and credentials on the Termix website, then type `xp` in Ghostty on Linux. On your home network, connections use your computer's OpenSSH client. When a target is not directly reachable (for example, a private home server while traveling), `xp` opens the selected host through the remote Termix server in the same Ghostty window. Neither route needs the Termix desktop app running.
 
 Setup downloads an initial copy of your hosts and credentials. A user timer refreshes it daily; `xp` also attempts a refresh before connecting. Refresh has a five-second total deadline. If the server is unavailable, the last complete encrypted copy remains usable. `xp --offline` skips the server entirely.
 
-The target machine must still be reachable from your computer. Existing connections continue if the Termix server goes down.
+Direct SSH still requires a route from your computer to the target. The remote Termix route requires the remote service, its home tunnel, and a Termix CLI login to be available.
+
+## Remote command-line access
+
+To use `xp` for home servers while away, install the official Termix CLI once
+and sign in to the remote primary:
+
+```bash
+npm install -g @termix-cli/cli
+termix login --url https://termix.homenet.house
+```
+
+The login uses your Termix account and is stored in Linux Secret Service. The
+CLI session expires periodically and may ask you to sign in again. This is a
+separate login from `xp`'s API key. No desktop app or background CLI service is
+needed. When `xp` finds that the laptop cannot reach the chosen target directly,
+it matches that exact host in Termix and runs `termix ssh` through the remote
+server; the shell appears in the current Ghostty tab. The remote server then
+uses the existing home tunnel. It will refuse ambiguous host matches.
+
+Use `xp --via-termix` to force a server-side session, or `xp --direct` to force
+your laptop's OpenSSH (including any configured `ProxyJump`). `xp --offline`
+also forces direct SSH because it skips contacting Termix. The server-side
+session uses Termix's saved host credential and host-key record; it does not
+copy or expose that credential to the laptop. If the remote server or home
+tunnel is down while you are away, cached host details alone cannot reach a
+private home address.
 
 ## Install
 
-Requires Linux, Python 3.10+, Python's `venv`/pip support, OpenSSH, and an unlocked Secret Service keyring such as GNOME Keyring. The installer uses a private virtual environment for its Python dependencies. It requires no root privileges and does not modify your shell startup files.
+Requires Linux, Python 3.10+, Python's `venv`/pip support, OpenSSH, and an unlocked Secret Service keyring such as GNOME Keyring. Node.js/npm and the official Termix CLI are only needed for remote terminal sessions through the server. The installer uses a private virtual environment for its Python dependencies. It requires no root privileges and does not modify your shell startup files.
 
 1. In Termix, create an API key for your account. Keep it ready for the hidden setup prompt. Termix API keys currently grant access to your account's data; the app does not offer a read-only sync scope.
 2. From this directory run:

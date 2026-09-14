@@ -71,6 +71,47 @@ class NativeTests(unittest.TestCase):
         creds[0]['certPublicKey'] = 'CERT'
         self.assertTrue(xp.resolve_rows(hosts, creds)[0]['unavailable_reason'])
 
+    def test_remote_route_matches_exact_saved_host_and_uses_cli_session(self):
+        host = {'ip': '10.0.10.100', 'port': 22, 'username': 'root'}
+        listing = {'hosts': [
+            {'id': 41, 'ip': '10.0.10.100', 'port': 22, 'username': 'root', 'connectionType': 'ssh'},
+            {'id': 42, 'ip': '10.0.10.100', 'port': 22, 'username': 'admin', 'connectionType': 'ssh'},
+        ]}
+        with patch.object(xp.shutil, 'which', return_value='/usr/bin/termix'), \
+             patch.object(xp.subprocess, 'run', return_value=type('Result', (), {'returncode': 0, 'stdout': json.dumps(listing)})()) as run:
+            self.assertEqual(xp.termix_host_id(host, 'https://termix.example'), '41')
+        args, kwargs = run.call_args
+        self.assertEqual(args[0], ['/usr/bin/termix', '--json', 'hosts'])
+        self.assertEqual(kwargs['env']['TERMIX_URL'], 'https://termix.example')
+        self.assertNotIn('TERMIX_API_KEY', kwargs['env'])
+        self.assertNotIn('TERMIX_TOKEN', kwargs['env'])
+
+    def test_remote_route_refuses_ambiguous_host_matches(self):
+        host = {'ip': '10.0.10.100', 'port': 22, 'username': 'root'}
+        row = {'id': 41, **host, 'connectionType': 'ssh'}
+        result = type('Result', (), {'returncode': 0, 'stdout': json.dumps({'hosts': [row, {**row, 'id': 42}]})})()
+        with patch.object(xp.shutil, 'which', return_value='/usr/bin/termix'), patch.object(xp.subprocess, 'run', return_value=result):
+            with self.assertRaisesRegex(xp.Error, 'uniquely match'):
+                xp.termix_host_id(host, 'https://termix.example')
+
+    def test_connection_uses_remote_only_when_direct_route_is_unavailable(self):
+        host = {'ip': '10.0.10.100', 'port': 22, 'username': 'root'}
+        with patch.object(xp, 'direct_tcp_available', return_value=False), patch.object(xp, 'connect_via_termix', return_value=0) as remote, patch.object(xp, 'connect_native') as native:
+            self.assertEqual(xp.connect(host, termix_url='https://termix.example'), 0)
+            remote.assert_called_once_with(host, 'https://termix.example')
+            native.assert_not_called()
+        with patch.object(xp, 'connect_via_termix', return_value=0) as remote, patch.object(xp, 'connect_native', return_value=0) as native:
+            xp.connect(host, termix_url='https://termix.example', direct_only=True)
+            native.assert_called_once_with(host)
+            remote.assert_not_called()
+
+    def test_explicit_remote_selection_skips_direct_probe(self):
+        host = {'ip': '10.0.10.100', 'port': 22, 'username': 'root'}
+        with patch.object(xp, 'direct_tcp_available') as probe, patch.object(xp, 'connect_via_termix', return_value=0) as remote:
+            xp.connect(host, termix_url='https://termix.example', via_termix=True)
+            probe.assert_not_called()
+            remote.assert_called_once_with(host, 'https://termix.example')
+
     def test_ssh_eligibility_uses_credentials_not_ui_or_old_labels(self):
         hosts, creds = self.fixture()
         hosts[0].update(enableSsh=True, enableTerminal=False,
@@ -214,7 +255,7 @@ class NativeTests(unittest.TestCase):
         self.assertTrue(lines[6].lstrip().startswith('3) Build next match'))
         with patch.object(xp, 'read_config', return_value=self.config()), patch.object(xp, 'load_secrets', return_value=('API', b'key')), patch.object(xp, 'inventory', return_value={'hosts': scored}), patch.object(xp, 'select', return_value=scored), patch.object(xp.sys.stdin, 'isatty', return_value=True), patch.object(xp.sys.stdout, 'isatty', return_value=True), patch('builtins.input', return_value='2'), patch('builtins.print'), patch.object(xp, 'connect', return_value=0) as connect:
             self.assertEqual(xp.main(['build', '--offline']), 0)
-        connect.assert_called_once_with(third)
+        connect.assert_called_once_with(third, termix_url='https://termix.invalid', via_termix=False, direct_only=True)
 
     def test_menu_sanitizes_controls_in_cached_labels(self):
         host = xp.resolve_rows(*self.fixture())[0]

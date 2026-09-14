@@ -579,7 +579,67 @@ def askpass():
     return 0
 
 
-def connect(host):
+def direct_tcp_available(host, timeout=0.7):
+    """Choose laptop SSH only when its network can reach this exact endpoint."""
+    try:
+        with socket.create_connection((host['ip'], host['port']), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def termix_host_id(host, termix_url):
+    binary = shutil.which('termix')
+    if not binary:
+        raise Error('This server is not directly reachable. Install the Termix CLI and sign in once to use the remote SSH route.')
+    env = os.environ.copy()
+    # Termix's API keys can read host metadata but cannot open terminal
+    # WebSockets. Force the CLI to use its own normal user login/keyring.
+    env.pop('TERMIX_API_KEY', None)
+    env.pop('TERMIX_TOKEN', None)
+    env['TERMIX_URL'] = termix_url
+    try:
+        result = subprocess.run([binary, '--json', 'hosts'], env=env, text=True,
+                                capture_output=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        raise Error('Could not query remote Termix hosts. Check that the Termix CLI is signed in and the remote server is reachable.') from None
+    if result.returncode:
+        raise Error('Could not query remote Termix hosts. Run `termix login --url ' + termix_url + '` and try again.')
+    try:
+        payload = json.loads(result.stdout)
+        rows = payload['hosts'] if isinstance(payload, dict) else payload
+        matches = [row for row in rows if isinstance(row, dict)
+                   and str(row.get('ip', '')) == host['ip']
+                   and row.get('username') == host['username']
+                   and (row.get('port') or 22) == host['port']
+                   and row.get('connectionType', 'ssh') == 'ssh']
+    except (ValueError, KeyError, TypeError):
+        raise Error('Remote Termix CLI returned an unrecognized host list.') from None
+    if len(matches) != 1 or not re.fullmatch(r'[0-9]+', str(matches[0].get('id', ''))):
+        raise Error('Could not uniquely match this saved host in remote Termix; refusing to connect to a different entry.')
+    return str(matches[0]['id'])
+
+
+def connect_via_termix(host, termix_url):
+    binary = shutil.which('termix')
+    if not binary:
+        raise Error('This server is not directly reachable. Install the Termix CLI and sign in once to use the remote SSH route.')
+    host_id = termix_host_id(host, termix_url)
+    env = os.environ.copy()
+    env.pop('TERMIX_API_KEY', None)
+    env.pop('TERMIX_TOKEN', None)
+    env['TERMIX_URL'] = termix_url
+    print('Opening this SSH session through remote Termix in Ghostty…', file=sys.stderr)
+    return subprocess.call([binary, 'ssh', host_id], env=env)
+
+
+def connect(host, *, termix_url, via_termix=False, direct_only=False):
+    if via_termix or (not direct_only and not direct_tcp_available(host)):
+        return connect_via_termix(host, termix_url)
+    return connect_native(host)
+
+
+def connect_native(host):
     if host['unavailable_reason']:
         raise Error(host['unavailable_reason'])
     binary = shutil.which('ssh')
@@ -653,6 +713,8 @@ def main(argv=None):
     group.add_argument('--servers', nargs=2, metavar=('PRIMARY', 'STANDBY'), help='Update HTTPS server order without replacing credentials or cache')
     group.add_argument('--sync', action='store_true', help='Refresh encrypted local cache and exit')
     group.add_argument('--offline', action='store_true', help='Use cache without contacting Termix')
+    group.add_argument('--via-termix', action='store_true', help='Open the selected shell through remote Termix')
+    group.add_argument('--direct', action='store_true', help='Force laptop OpenSSH, including configured SSH proxies')
     parser.add_argument('--list', action='store_true', help='Safe JSON inventory, no secrets')
     parser.add_argument('--all', action='store_true', help='Include disabled/unsupported hosts')
     parser.add_argument('--check', action='store_true', help='Show cache status without SSH login')
@@ -662,6 +724,8 @@ def main(argv=None):
         return 0
     cfg = read_config()
     api_key, key = load_secrets(cfg)
+    if args.via_termix and args.offline:
+        raise Error('--via-termix cannot be combined with --offline.')
     if args.servers:
         configure_servers(cfg, api_key, args.servers)
         return 0
@@ -690,7 +754,10 @@ def main(argv=None):
         if not answer.isdecimal() or not 1 <= int(answer) <= len(hosts):
             raise Error('Invalid host number.')
         chosen = hosts[int(answer)-1]
-    return connect(chosen)
+    termix_url = cfg.get('servers', [cfg['url']])[0]
+    return connect(chosen, termix_url=termix_url,
+                   via_termix=args.via_termix,
+                   direct_only=args.direct or args.offline)
 
 
 if __name__ == '__main__':
