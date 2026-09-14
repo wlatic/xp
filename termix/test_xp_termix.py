@@ -1,4 +1,6 @@
 import importlib.util
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -150,6 +152,36 @@ class NativeTests(unittest.TestCase):
         with patch.dict('sys.modules', {'keyring.backends.SecretService': None}):
             with self.assertRaisesRegex(xp.Error, 'No plaintext fallback'):
                 xp.keyring_backend()
+
+    def test_hierarchical_menu_numbering_after_interleaved_filter_scores(self):
+        rows = xp.resolve_rows(*self.fixture())
+        first = dict(rows[0], name='Build best match', folder='Personal / Docker')
+        second = dict(rows[1], name='Build next match', folder='Work / Docker')
+        third = dict(rows[0], name='Build last match', folder='Personal / Docker')
+        scored = [first, second, third]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            ordered = xp.display_menu(scored)
+        self.assertEqual(ordered, [first, third, second])
+        lines = output.getvalue().splitlines()
+        self.assertEqual(lines[0:2], ['Personal', '  Docker'])
+        self.assertTrue(lines[2].lstrip().startswith('1) Build best match'))
+        self.assertTrue(lines[3].lstrip().startswith('2) Build last match'))
+        self.assertEqual(lines[4:6], ['Work', '  Docker'])
+        self.assertTrue(lines[6].lstrip().startswith('3) Build next match'))
+        with patch.object(xp, 'read_config', return_value=self.config()), patch.object(xp, 'load_secrets', return_value=('API', b'key')), patch.object(xp, 'inventory', return_value={'hosts': scored}), patch.object(xp, 'select', return_value=scored), patch.object(xp.sys.stdin, 'isatty', return_value=True), patch.object(xp.sys.stdout, 'isatty', return_value=True), patch('builtins.input', return_value='2'), patch('builtins.print'), patch.object(xp, 'connect', return_value=0) as connect:
+            self.assertEqual(xp.main(['build', '--offline']), 0)
+        connect.assert_called_once_with(third)
+
+    def test_menu_sanitizes_controls_in_cached_labels(self):
+        host = xp.resolve_rows(*self.fixture())[0]
+        host.update(folder='Personal\x1b / Docker\nInjected', name='Host\x1b[31m', unavailable_reason='reason\nspoof')
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            xp.display_menu([host])
+        self.assertNotIn('\x1b', output.getvalue())
+        self.assertEqual(len(output.getvalue().splitlines()), 3)
+        self.assertIn('Docker Injected', output.getvalue())
 
     def test_installer_preserves_original_symlink(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -31,6 +31,32 @@ The installer verifies the initial encrypted copy before replacing a user-local 
 
 To try it without changing `xp`, omit `--activate` and use `xp-termix`. To skip the daily timer, add `--no-timer`.
 
+## Update an existing installation
+
+From the new release's `termix/` directory, run:
+
+```bash
+python3 install.py --activate
+hash -r
+```
+
+This keeps your existing keyring credentials and encrypted cache. It checks the local copy before activating the updated command; you do not need `--setup` again.
+
+The interactive picker now shows the folders from Termix as a hierarchy, with one continuous set of host numbers:
+
+```text
+Personal
+  Docker
+      1) Build server  admin@192.0.2.10:22
+  Proxmox
+      2) Hypervisor  root@192.0.2.20:22
+Work
+  Docker
+      3) Deployment server  deploy@198.51.100.10:22
+```
+
+Filters still search folder names as well as hosts. Matching hosts stay grouped under their folder headings; their order within each folder follows match quality. A single matching host still connects immediately.
+
 ## Commands
 
 ```bash

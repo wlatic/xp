@@ -357,6 +357,31 @@ def select(hosts, filters):
     return [h for _, h in sorted(matched, key=lambda pair: (-pair[0], pair[1]['folder'].casefold(), pair[1]['name'].casefold()))]
 
 
+def display_menu(hosts):
+    """Render folder hierarchy and return hosts in exactly the numbered order."""
+    tree = {'hosts': [], 'children': {}}
+    for host in hosts:
+        node = tree
+        folder = clean(host['folder']) or 'Uncategorized'
+        for segment in folder.split(' / '):
+            label = segment.strip() or 'Uncategorized'
+            node = node['children'].setdefault(label, {'hosts': [], 'children': {}})
+        node['hosts'].append(host)
+    ordered = []
+
+    def render(node, depth):
+        for host in node['hosts']:
+            ordered.append(host)
+            note = ' [' + clean(host['unavailable_reason']) + ']' if host['unavailable_reason'] else ''
+            print(f"{'  ' * depth}{len(ordered):>3}) {clean(host['name'])}  {clean(host['username'])}@{clean(host['ip'])}:{host['port']}{note}")
+        for label in sorted(node['children'], key=lambda value: (value.casefold(), value)):
+            print(f"{'  ' * depth}{label}")
+            render(node['children'][label], depth + 1)
+
+    render(tree, 0)
+    return ordered
+
+
 def public_host(host):
     return {k: host[k] for k in ('name', 'ip', 'port', 'username', 'folder', 'tags', 'authType', 'unavailable_reason')}
 
@@ -492,9 +517,7 @@ def main(argv=None):
     if len(hosts) == 1:
         chosen = hosts[0]
     else:
-        for index, host in enumerate(hosts, 1):
-            note = ' [' + host['unavailable_reason'] + ']' if host['unavailable_reason'] else ''
-            print(f"{index:>3}) [{host['folder']}] {host['name']} {clean(host['username'])}@{clean(host['ip'])}:{host['port']}{note}")
+        hosts = display_menu(hosts)
         answer = input('Host number (q or Enter to cancel): ').strip()
         if not answer or answer.lower() == 'q':
             return 0
