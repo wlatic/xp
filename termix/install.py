@@ -42,8 +42,11 @@ def install(source, target):
         print(f"To restore it: move that backup back to {target}")
 
 
-def unit_quote(value):
-    return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%').replace('$', '$$') + '"'
+def unit_quote(value, exec_expansion=True):
+    escaped = str(value).replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%')
+    if exec_expansion:
+        escaped = escaped.replace('$', '$$')
+    return '"' + escaped + '"'
 
 
 def main():
@@ -83,7 +86,7 @@ def main():
         units = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'systemd' / 'user'
         units.mkdir(parents=True, exist_ok=True)
         service = runtime / 'xp-termix-sync.service'
-        unit_env = ''.join('Environment=' + unit_quote(name + '=' + os.environ[name]) + '\n' for name in ('XDG_CONFIG_HOME', 'XDG_DATA_HOME') if name in os.environ)
+        unit_env = ''.join('Environment=' + unit_quote(name + '=' + os.environ[name], exec_expansion=False) + '\n' for name in ('XDG_CONFIG_HOME', 'XDG_DATA_HOME') if name in os.environ)
         service.write_text('[Unit]\nDescription=Refresh encrypted Termix SSH inventory\n\n[Service]\nType=oneshot\n' + unit_env + 'ExecStart=' + unit_quote(args.bin_dir / 'xp-termix') + ' --sync\nUMask=0077\nTimeoutStartSec=30\n')
         timer = runtime / 'xp-termix-sync.timer'
         timer.write_text('[Unit]\nDescription=Daily Termix SSH inventory refresh\n\n[Timer]\nOnCalendar=daily\nPersistent=true\nRandomizedDelaySec=10m\nUnit=xp-termix-sync.service\n\n[Install]\nWantedBy=timers.target\n')
