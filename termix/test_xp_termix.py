@@ -342,6 +342,18 @@ class CascadeTests(unittest.TestCase):
         finally:
             release.set()
 
+    def test_primary_gets_headroom_and_standby_only_remaining_total_budget(self):
+        def candidate(url, key, owner, *, standby, timeout):
+            if not standby:
+                self.assertEqual(timeout, 3.5)
+                raise xp.Error('primary timed out')
+            self.assertEqual(timeout, 1.5)
+            return [], {'source': url, 'data_time': 1}
+        with patch.object(xp.time, 'monotonic', side_effect=[100, 100, 103.5]), patch.object(xp, 'download_candidate', side_effect=candidate):
+            hosts, metadata = xp.download_servers(self.cfg(), 'SECRET', None)
+        self.assertEqual(hosts, [])
+        self.assertEqual(metadata['source'], 'https://standby.invalid')
+
     def test_total_budget_and_late_workers_cannot_promote(self):
         def stalled(*args):
             time.sleep(0.25)

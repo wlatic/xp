@@ -98,7 +98,7 @@ remain intact. Installation and endpoint changes are performed by you locally.
 
 Every normal `xp` invocation then tries the primary, the standby, and finally its
 existing encrypted cache. Both network attempts share a five-second total deadline:
-the primary receives up to 2.5 seconds, and the standby receives the remaining time.
+the primary receives up to 3.5 seconds, and the standby receives the remaining time.
 Each candidate reads account identity, hosts and credentials concurrently from that
 one server. All three responses must pass account and snapshot validation before
 any cache update; slow requests cannot delay the deadline or write data later.

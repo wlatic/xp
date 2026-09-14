@@ -300,7 +300,7 @@ def download_servers(cfg, api_key, cached):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        budget = min(CASCADE_TIMEOUT / 2, remaining) if index == 0 else remaining
+        budget = min(CASCADE_TIMEOUT * 0.7, remaining) if index == 0 else remaining
         try:
             hosts, metadata = download_candidate(url, api_key, cfg['owner_id'], standby=index > 0, timeout=budget)
             previous_time = cached.get('data_time', cached['updated_at']) if cached else 0
