@@ -346,10 +346,15 @@ def score(pattern, text):
 
 
 def select(hosts, filters):
+    searchable = [(host, f"{host['name']} {host['username']}@{host['ip']} {host['folder']} {' '.join(host['tags'])}".casefold()) for host in hosts]
+    terms = [term.casefold() for term in filters]
+    # Determine each term's mode against the same original candidates, so AND
+    # filters are order-independent and literal matches never lose to a score.
+    literal = [any(term in text for _, text in searchable) for term in terms]
     matched = []
-    for host in hosts:
-        text = f"{host['name']} {host['username']}@{host['ip']} {host['folder']} {' '.join(host['tags'])}"
-        scores = [score(f, text) for f in filters]
+    for host, text in searchable:
+        scores = [score(term, text) if not prefer_literal or term in text else 0
+                  for term, prefer_literal in zip(terms, literal)]
         if all(scores):
             matched.append((sum(scores), host))
     return [h for _, h in sorted(matched, key=lambda pair: (-pair[0], pair[1]['folder'].casefold(), pair[1]['name'].casefold()))]

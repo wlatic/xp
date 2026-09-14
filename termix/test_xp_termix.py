@@ -95,6 +95,34 @@ class NativeTests(unittest.TestCase):
         self.assertNotIn('\x1b', rows[0]['name'])
         self.assertNotIn('\n', rows[0]['name'])
 
+    def test_literal_ai_excludes_migration_tag_subsequences(self):
+        hosts, creds = self.fixture()
+        hosts[0].update(name='AI - Agents', tags=['migration'])
+        hosts[1].update(name='Router', tags=['migration'])
+        rows = xp.resolve_rows(hosts, creds)
+        self.assertEqual(xp.select(rows, ['AI']), [rows[0]])
+        self.assertEqual(len(xp.select(rows, ['migration'])), 2)
+
+    def test_literal_matches_are_all_kept_and_fuzzy_fallback_remains(self):
+        hosts, creds = self.fixture()
+        hosts[0]['name'] = 'AI - Agents'
+        hosts[1]['name'] = 'Mail Server'
+        rows = xp.resolve_rows(hosts, creds)
+        self.assertEqual(len(xp.select(rows, ['ai'])), 2)
+        self.assertEqual(xp.select(rows, ['mlsv']), [rows[1]])
+
+    def test_literal_and_fuzzy_filters_are_and_order_independent(self):
+        hosts, creds = self.fixture()
+        hosts[0].update(name='AI - Agents', username='root', tags=['migration'])
+        hosts[1].update(name='Router', username='admin', tags=['migration'])
+        rows = xp.resolve_rows(hosts, creds)
+        for terms in (['ai', 'root'], ['root', 'ai']):
+            self.assertEqual(xp.select(rows, terms), [rows[0]])
+        for terms in (['ai', 'admin'], ['admin', 'ai']):
+            self.assertEqual(xp.select(rows, terms), [])
+        for terms in (['ai', 'agts'], ['agts', 'ai']):
+            self.assertEqual(xp.select(rows, terms), [rows[0]])
+
     def test_shell_injection_addresses_disabled(self):
         for value in ('-oProxyCommand=evil', 'host;echo evil', 'host\n', '$(echo evil)'):
             hosts, creds = self.fixture()

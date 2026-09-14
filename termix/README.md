@@ -55,7 +55,7 @@ Work
       3) Deployment server  deploy@198.51.100.10:22
 ```
 
-Filters still search folder names as well as hosts. Matching hosts stay grouped under their folder headings; their order within each folder follows match quality. A single matching host still connects immediately.
+Filters search host names, addresses, usernames, folders and tags. Each term prefers all case-insensitive literal matches; fuzzy matching is used only when that term has no literal match. Multiple terms use AND matching regardless of their order. This lets `xp ai` select an AI host without unrelated subsequence matches in migration tags. Matching hosts stay grouped under their folder headings; their order within each folder follows match quality. A single matching host still connects immediately.
 
 ## Commands
 
