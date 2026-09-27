@@ -1,6 +1,8 @@
 # xp with Termix sync and remote SSH fallback
 
-Manage hosts and credentials on the Termix website, then type `xp` in Ghostty on Linux. On your home network, connections use your computer's OpenSSH client. When a target is not directly reachable (for example, a private home server while traveling), `xp` opens the selected host through the remote Termix server in the same Ghostty window. Neither route needs the Termix desktop app running.
+Manage hosts and credentials on the Termix website, then type `xp` in Ghostty on Linux. For a directly reachable host, `xp` uses Mosh when it is installed on the laptop, bootstrapping with your computer's OpenSSH client and the saved Termix credential. Without Mosh, it uses OpenSSH. When a target is not directly reachable (for example, a private home server while traveling), `xp` opens the selected host through the remote Termix server in the same Ghostty window. Neither route needs the Termix desktop app running.
+
+For `xp ai` across Wi-Fi interruptions, install Mosh on both the laptop and AI host (`sudo dnf install mosh` on Fedora; `sudo apt install mosh` on Debian). Mosh needs UDP from the laptop to the host, normally ports 60000–61000. The AI processes should stay in remote tmux sessions; Mosh keeps the live terminal connected during brief network drops while tmux preserves sessions and scrollback. `xp --direct ai` forces plain OpenSSH if Mosh or its UDP route is unavailable. Mosh is only selected for directly reachable hosts; the remote Termix route remains `termix ssh`.
 
 Setup downloads an initial copy of your hosts and credentials. A user timer refreshes it daily; `xp` also attempts a refresh before connecting. Refresh has a five-second total deadline. If the server is unavailable, the last complete encrypted copy remains usable. `xp --offline` skips the server entirely.
 
@@ -25,8 +27,8 @@ server; the shell appears in the current Ghostty tab. The remote server then
 uses the existing home tunnel. It will refuse ambiguous host matches.
 
 Use `xp --via-termix` to force a server-side session, or `xp --direct` to force
-your laptop's OpenSSH (including any configured `ProxyJump`). `xp --offline`
-also forces direct SSH because it skips contacting Termix. The server-side
+your laptop's OpenSSH (including any configured `ProxyJump`) instead of Mosh.
+`xp --offline` also forces direct SSH because it skips contacting Termix. The server-side
 session uses Termix's saved host credential and host-key record; it does not
 copy or expose that credential to the laptop. If the remote server or home
 tunnel is down while you are away, cached host details alone cannot reach a

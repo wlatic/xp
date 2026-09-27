@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import tempfile
 import threading
 import time
@@ -104,6 +105,37 @@ class NativeTests(unittest.TestCase):
             xp.connect(host, termix_url='https://termix.example', direct_only=True)
             native.assert_called_once_with(host)
             remote.assert_not_called()
+
+    def test_reachable_host_uses_mosh_when_installed_and_direct_forces_ssh(self):
+        host = {'ip': '10.0.10.100', 'port': 22, 'username': 'root'}
+        with patch.object(xp, 'direct_tcp_available', return_value=True), \
+             patch.object(xp.shutil, 'which', return_value='/usr/bin/mosh'), \
+             patch.object(xp, 'connect_native', return_value=0) as native:
+            xp.connect(host, termix_url='https://termix.example')
+            native.assert_called_once_with(host, mosh_binary='/usr/bin/mosh')
+            native.reset_mock()
+            xp.connect(host, termix_url='https://termix.example', direct_only=True)
+            native.assert_called_once_with(host)
+
+    def test_mosh_bootstrap_keeps_saved_ssh_auth_and_host_checks(self):
+        host = {'ip': '10.0.10.100', 'port': 2222, 'username': 'root',
+                'password': 'SAVED-SECRET', 'key': None, 'unavailable_reason': ''}
+
+        def inspect(argv, *, env):
+            self.assertEqual(argv[0], '/usr/bin/mosh')
+            self.assertEqual(argv[-2:], ['--', 'root@10.0.10.100'])
+            ssh = shlex.split(argv[1].removeprefix('--ssh='))
+            self.assertEqual(ssh[0], '/usr/bin/ssh')
+            self.assertEqual(ssh[-4:], ['-p', '2222', '-l', 'root'])
+            self.assertIn('StrictHostKeyChecking=ask', ssh)
+            self.assertEqual(env['SSH_ASKPASS_REQUIRE'], 'force')
+            self.assertTrue(Path(env['SSH_ASKPASS']).is_file())
+            self.assertNotIn('SAVED-SECRET', repr(argv))
+            return 0
+
+        with patch.object(xp.shutil, 'which', return_value='/usr/bin/ssh'), \
+             patch.object(xp.subprocess, 'call', side_effect=inspect):
+            self.assertEqual(xp.connect_native(host, mosh_binary='/usr/bin/mosh'), 0)
 
     def test_explicit_remote_selection_skips_direct_probe(self):
         host = {'ip': '10.0.10.100', 'port': 22, 'username': 'root'}

@@ -636,10 +636,11 @@ def connect_via_termix(host, termix_url):
 def connect(host, *, termix_url, via_termix=False, direct_only=False):
     if via_termix or (not direct_only and not direct_tcp_available(host)):
         return connect_via_termix(host, termix_url)
-    return connect_native(host)
+    mosh_binary = shutil.which('mosh') if not direct_only else None
+    return connect_native(host, mosh_binary=mosh_binary) if mosh_binary else connect_native(host)
 
 
-def connect_native(host):
+def connect_native(host, mosh_binary=None):
     if host['unavailable_reason']:
         raise Error(host['unavailable_reason'])
     binary = shutil.which('ssh')
@@ -695,7 +696,14 @@ def connect_native(host):
                 argv += ['-o', 'IdentitiesOnly=yes', '-o', 'PreferredAuthentications=publickey', '-i', f'/proc/{os.getpid()}/fd/{keyfd}']
             else:
                 argv += ['-o', 'PubkeyAuthentication=no', '-o', 'PreferredAuthentications=password,keyboard-interactive']
-            argv += ['-p', str(host['port']), '-l', host['username'], '--', host['ip']]
+            argv += ['-p', str(host['port']), '-l', host['username']]
+            if mosh_binary:
+                # Mosh uses SSH only to start mosh-server. Keep the same host-key
+                # checks and temporary credential helpers for that bootstrap.
+                argv = [mosh_binary, '--ssh=' + shlex.join(argv), '--',
+                        host['username'] + '@' + host['ip']]
+            else:
+                argv += ['--', host['ip']]
             return subprocess.call(argv, env=env)
         finally:
             if keyfd is not None:
