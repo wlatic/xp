@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import shlex
+import socket
+import subprocess
 import tempfile
 import threading
 import time
@@ -112,7 +114,7 @@ class NativeTests(unittest.TestCase):
              patch.object(xp.shutil, 'which', return_value='/usr/bin/mosh'), \
              patch.object(xp, 'connect_native', return_value=0) as native:
             xp.connect(host, termix_url='https://termix.example')
-            native.assert_called_once_with(host, mosh_binary='/usr/bin/mosh')
+            native.assert_called_once_with(host, mosh_binary='/usr/bin/mosh', prepare=True)
             native.reset_mock()
             xp.connect(host, termix_url='https://termix.example', direct_only=True)
             native.assert_called_once_with(host)
@@ -136,6 +138,129 @@ class NativeTests(unittest.TestCase):
         with patch.object(xp.shutil, 'which', return_value='/usr/bin/ssh'), \
              patch.object(xp.subprocess, 'call', side_effect=inspect):
             self.assertEqual(xp.connect_native(host, mosh_binary='/usr/bin/mosh'), 0)
+
+    def test_mosh_preparation_preserves_auth_and_falls_back_for_missing_remote(self):
+        for key in (None, 'PRIVATE-KEY'):
+            host = {'ip': '192.0.2.10', 'port': 2222, 'username': 'root',
+                    'password': 'SAVED-SECRET', 'key': key,
+                    'keyPassword': 'KEY-SECRET', 'unavailable_reason': ''}
+            probes = []
+
+            def check(argv, *, env, **kwargs):
+                probes.append(argv)
+                self.assertIn('StrictHostKeyChecking=ask', argv)
+                self.assertEqual(argv[argv.index('-p') + 1], '2222')
+                self.assertEqual(argv[argv.index('-l') + 1], 'root')
+                self.assertEqual(argv[-2], host['ip'])
+                self.assertNotIn('SECRET', repr(argv))
+                with socket.socket(socket.AF_UNIX) as client:
+                    client.connect(env['XP_ASKPASS_SOCKET'])
+                    client.sendall(b'keyPassword' if key else b'password')
+                    self.assertEqual(client.recv(4096).decode(), 'KEY-SECRET' if key else 'SAVED-SECRET')
+                if key:
+                    self.assertEqual(Path(argv[argv.index('-i') + 1]).read_text(), key + '\n')
+                return subprocess.CompletedProcess(argv, 0, 'XP_MOSH_MISSING' if len(probes) == 1 else '')
+
+            def shell(argv, *, env):
+                self.assertEqual(argv[0], '/usr/bin/ssh')
+                self.assertEqual(argv[-2:], ['--', host['ip']])
+                self.assertEqual(argv[:-2], probes[0][:-4])
+                self.assertTrue(Path(env['SSH_ASKPASS']).exists())
+                return 7
+
+            with self.subTest(key=bool(key)), \
+                 patch.object(xp.shutil, 'which', return_value='/usr/bin/ssh'), \
+                 patch.object(xp.subprocess, 'run', side_effect=check), \
+                 patch.object(xp.subprocess, 'call', side_effect=shell), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(xp.connect_native(host, mosh_binary='/usr/bin/mosh', prepare=True), 7)
+                self.assertEqual(len(probes), 2)
+                self.assertIn('nohup timeout 120', probes[1][-1])
+                self.assertIn('</dev/null >/dev/null 2>&1 &', probes[1][-1])
+
+    def test_ready_remote_selects_mosh_only_with_local_binary(self):
+        result = subprocess.CompletedProcess([], 0, 'XP_MOSH_READY')
+        with patch.object(xp.subprocess, 'run', return_value=result), \
+             patch.object(xp.subprocess, 'Popen') as install, \
+             patch.object(xp.shutil, 'which', return_value='/usr/bin/timeout'), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(xp.prepare_mosh(['ssh'], {}, '192.0.2.1', '/usr/bin/mosh'), '/usr/bin/mosh')
+            install.assert_not_called()
+            self.assertIsNone(xp.prepare_mosh(['ssh'], {}, '192.0.2.1', None))
+            self.assertEqual(install.call_args.args[0][:2], ['/usr/bin/timeout', '120'])
+            self.assertTrue(install.call_args.kwargs['start_new_session'])
+            self.assertEqual(install.call_args.kwargs['stdin'], subprocess.DEVNULL)
+
+    def test_mosh_preparation_failures_never_block_ssh(self):
+        host = {'ip': '192.0.2.1', 'port': 22, 'username': 'root',
+                'password': 'secret', 'key': None, 'unavailable_reason': ''}
+        missing = subprocess.CompletedProcess([], 0, 'XP_MOSH_MISSING')
+        denied = subprocess.CompletedProcess([], 255, '')
+        timeout = subprocess.TimeoutExpired('ssh', 15)
+        for responses in ([denied], [timeout], [OSError('failed')],
+                          [missing, timeout], [missing, OSError('failed')]):
+            with self.subTest(responses=responses), \
+                 patch.object(xp.shutil, 'which', return_value='/usr/bin/ssh'), \
+                 patch.object(xp.subprocess, 'run', side_effect=responses), \
+                 patch.object(xp.subprocess, 'call', return_value=0) as shell, \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(xp.connect_native(host, mosh_binary='/usr/bin/mosh', prepare=True), 0)
+                self.assertEqual(shell.call_args.args[0][0], '/usr/bin/ssh')
+
+    def test_missing_local_install_failure_stays_on_ssh(self):
+        result = subprocess.CompletedProcess([], 0, 'XP_MOSH_READY')
+        with patch.object(xp.subprocess, 'run', return_value=result), \
+             patch.object(xp.subprocess, 'Popen', side_effect=OSError('failed')), \
+             patch.object(xp.shutil, 'which', return_value='/usr/bin/timeout'), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(xp.prepare_mosh(['ssh'], {}, '192.0.2.1', None))
+
+    def test_mosh_start_failure_falls_back_but_session_status_does_not(self):
+        host = {'ip': '192.0.2.1', 'port': 22, 'username': 'root',
+                'password': 'secret', 'key': None, 'unavailable_reason': ''}
+        for results in ([OSError('missing binary'), 0], [4]):
+            with patch.object(xp.shutil, 'which', return_value='/usr/bin/ssh'), \
+                 patch.object(xp.subprocess, 'call', side_effect=results) as shell, \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(xp.connect_native(host, mosh_binary='/usr/bin/mosh'), results[-1])
+                self.assertEqual(shell.call_count, len(results))
+                if len(results) == 2:
+                    self.assertEqual(shell.call_args.args[0][0], '/usr/bin/ssh')
+
+    def test_package_install_uses_root_or_noninteractive_sudo(self):
+        for uid, sudo_status, expected in (('0', 0, True), ('1000', 0, True), ('1000', 1, False)):
+            with self.subTest(uid=uid, sudo_status=sudo_status), tempfile.TemporaryDirectory() as folder:
+                path = Path(folder)
+                scripts = {
+                    'id': '#!/bin/sh\nprintf "%s" ' + uid + '\n',
+                    'sudo': '#!/bin/sh\n[ "$1" = -n ] || exit 99\nshift\n'
+                            '[ "$1" != true ] || exit ' + str(sudo_status) + '\nexec "$@"\n',
+                    'env': '#!/bin/sh\nshift\nexec "$@"\n',
+                    'apt-get': '#!/bin/sh\nprintf "%s\\n" "$@" > "$INSTALL_LOG"\n',
+                }
+                for name, script in scripts.items():
+                    binary = path / name
+                    binary.write_text(script)
+                    binary.chmod(0o700)
+                log = path / 'installed'
+                result = subprocess.run(['/bin/sh', '-c', xp.MOSH_INSTALL],
+                                        env={'PATH': folder, 'INSTALL_LOG': str(log)}, capture_output=True)
+                self.assertEqual(result.returncode == 0, expected)
+                self.assertEqual(log.exists(), expected)
+                if expected:
+                    self.assertEqual(log.read_text().splitlines(), ['-o', 'DPkg::Lock::Timeout=5', 'install', '-y', 'mosh'])
+
+    def test_remote_install_command_detaches_all_streams(self):
+        missing = subprocess.CompletedProcess([], 0, 'XP_MOSH_MISSING')
+        with patch.object(xp.subprocess, 'run', return_value=missing) as run, \
+             patch.object(xp, 'MOSH_INSTALL', '/bin/sleep 0.4'), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(xp.prepare_mosh(['ssh'], {}, '192.0.2.1', '/usr/bin/mosh'))
+            command = run.call_args.args[0][-1]
+        # Capturing pipes would wait for the installer if it inherited SSH's
+        # streams. The package job deliberately outlasts this shell's deadline.
+        result = subprocess.run(['/bin/sh', '-c', command], capture_output=True, timeout=0.3)
+        self.assertEqual(result.returncode, 0)
 
     def test_explicit_remote_selection_skips_direct_probe(self):
         host = {'ip': '10.0.10.100', 'port': 22, 'username': 'root'}

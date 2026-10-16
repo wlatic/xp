@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import queue
 import secrets
+import shlex
 import shutil
 import socket
 import struct
@@ -633,14 +634,75 @@ def connect_via_termix(host, termix_url):
     return subprocess.call([binary, 'ssh', host_id], env=env)
 
 
+# Install only from the system package manager, never prompt for sudo, and let
+# the current terminal open over SSH while the bounded background job runs.
+MOSH_INSTALL = """set -eu
+if [ "$(id -u)" = 0 ]; then
+    as_root() { "$@"; }
+else
+    command -v sudo >/dev/null 2>&1 || exit 1
+    sudo -n true || exit 1
+    as_root() { sudo -n "$@"; }
+fi
+if command -v apt-get >/dev/null 2>&1; then
+    as_root env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=5 install -y mosh
+elif command -v dnf >/dev/null 2>&1; then
+    as_root dnf -y install mosh
+elif command -v yum >/dev/null 2>&1; then
+    as_root yum -y install mosh
+elif command -v apk >/dev/null 2>&1; then
+    as_root apk add mosh
+elif command -v pacman >/dev/null 2>&1; then
+    as_root pacman -S --needed --noconfirm mosh
+elif command -v zypper >/dev/null 2>&1; then
+    as_root zypper --non-interactive install mosh
+else
+    exit 1
+fi
+"""
+
+
+def prepare_mosh(ssh, env, host, mosh_binary):
+    """Check both ends using saved SSH auth; missing tools keep this call on SSH."""
+    if not mosh_binary:
+        print('Mosh is missing locally; using SSH. Attempting a background install for next time.', file=sys.stderr)
+        timeout = shutil.which('timeout')
+        if timeout:
+            try:
+                subprocess.Popen([timeout, '120', 'sh', '-c', MOSH_INSTALL],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+            except OSError:
+                pass
+    remote = ssh + ['-T', '--', host]
+    try:
+        result = subprocess.run(remote + ["command -v mosh-server >/dev/null 2>&1 && printf XP_MOSH_READY || printf XP_MOSH_MISSING"],
+                                env=env, capture_output=True, text=True, timeout=15, check=False)
+        if result.returncode == 0 and result.stdout.strip() == 'XP_MOSH_READY':
+            return mosh_binary
+        if result.returncode == 0 and result.stdout.strip() == 'XP_MOSH_MISSING':
+            print('Mosh is missing on the host; using SSH. Attempting a background install for next time.', file=sys.stderr)
+            command = ('command -v timeout >/dev/null 2>&1 && '
+                       'nohup timeout 120 sh -c ' + shlex.quote(MOSH_INSTALL) +
+                       ' </dev/null >/dev/null 2>&1 &')
+            subprocess.run(remote + [command], env=env, capture_output=True,
+                           timeout=15, check=False)
+        else:
+            print('Could not verify remote Mosh; using SSH.', file=sys.stderr)
+    except (OSError, subprocess.TimeoutExpired):
+        print('Could not prepare Mosh; using SSH.', file=sys.stderr)
+    return None
+
+
 def connect(host, *, termix_url, via_termix=False, direct_only=False):
     if via_termix or (not direct_only and not direct_tcp_available(host)):
         return connect_via_termix(host, termix_url)
-    mosh_binary = shutil.which('mosh') if not direct_only else None
-    return connect_native(host, mosh_binary=mosh_binary) if mosh_binary else connect_native(host)
+    if direct_only:
+        return connect_native(host)
+    return connect_native(host, mosh_binary=shutil.which('mosh'), prepare=True)
 
 
-def connect_native(host, mosh_binary=None):
+def connect_native(host, mosh_binary=None, prepare=False):
     if host['unavailable_reason']:
         raise Error(host['unavailable_reason'])
     binary = shutil.which('ssh')
@@ -681,7 +743,6 @@ def connect_native(host, mosh_binary=None):
         thread = threading.Thread(target=serve, daemon=True)
         thread.start()
         # The helper has no secret contents; its interpreter path is shell-quoted.
-        import shlex
         helper = Path(folder) / 'askpass'
         helper.write_text('#!/bin/sh\nexec ' + shlex.quote(sys.executable) + ' ' + shlex.quote(str(Path(__file__).resolve())) + ' --askpass "$@"\n')
         helper.chmod(0o700)
@@ -697,6 +758,9 @@ def connect_native(host, mosh_binary=None):
             else:
                 argv += ['-o', 'PubkeyAuthentication=no', '-o', 'PreferredAuthentications=password,keyboard-interactive']
             argv += ['-p', str(host['port']), '-l', host['username']]
+            if prepare:
+                mosh_binary = prepare_mosh(argv, env, host['ip'], mosh_binary)
+            ssh_argv = argv + ['--', host['ip']]
             if mosh_binary:
                 # Mosh uses SSH only to start mosh-server. Keep the same host-key
                 # checks and temporary credential helpers for that bootstrap.
@@ -704,7 +768,13 @@ def connect_native(host, mosh_binary=None):
                         host['username'] + '@' + host['ip']]
             else:
                 argv += ['--', host['ip']]
-            return subprocess.call(argv, env=env)
+            try:
+                return subprocess.call(argv, env=env)
+            except OSError:
+                if not mosh_binary:
+                    raise
+                print('Could not start Mosh; using SSH.', file=sys.stderr)
+                return subprocess.call(ssh_argv, env=env)
         finally:
             if keyfd is not None:
                 os.close(keyfd)
