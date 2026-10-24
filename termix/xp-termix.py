@@ -662,6 +662,33 @@ fi
 """
 
 
+
+# Use a locale available on this server, without changing its global settings.
+# Mosh's client-supplied -l options are only a fallback when the native locale
+# is unusable; setting a valid LC_ALL here also avoids that incompatible locale.
+MOSH_UTF8 = """xp_charmap=$(locale charmap 2>/dev/null) || xp_charmap=
+if [ "$xp_charmap" != UTF-8 ] && [ "$xp_charmap" != UTF8 ]; then
+    xp_utf8=
+    for xp_locale in $(LC_ALL=C locale -a 2>/dev/null); do
+        case "$xp_locale" in
+            *.[uU][tT][fF]8|*.[uU][tT][fF]-8)
+                xp_charmap=$(LC_ALL="$xp_locale" locale charmap 2>/dev/null) || continue
+                case "$xp_charmap" in UTF-8|UTF8) xp_utf8=$xp_locale; break;; esac
+                ;;
+        esac
+    done
+    [ -n "$xp_utf8" ] || exit 1
+else
+    xp_utf8=${LC_ALL:-${LC_CTYPE:-${LANG:-}}}
+fi
+# Override all categories, including an invalid forwarded LC_MESSAGES.
+export LC_ALL="$xp_utf8" LANG="$xp_utf8"
+"""
+MOSH_SERVER = 'sh -c ' + shlex.quote(MOSH_UTF8 + 'exec mosh-server "$@"\n') + ' xp-mosh'
+MOSH_PROBE = ('if ! command -v mosh-server >/dev/null 2>&1; then '
+              'printf XP_MOSH_MISSING; exit 0; fi\n' + MOSH_UTF8 + 'printf XP_MOSH_READY')
+
+
 def prepare_mosh(ssh, env, host, mosh_binary):
     """Check both ends using saved SSH auth; missing tools keep this call on SSH."""
     if not mosh_binary:
@@ -676,7 +703,7 @@ def prepare_mosh(ssh, env, host, mosh_binary):
                 pass
     remote = ssh + ['-T', '--', host]
     try:
-        result = subprocess.run(remote + ["command -v mosh-server >/dev/null 2>&1 && printf XP_MOSH_READY || printf XP_MOSH_MISSING"],
+        result = subprocess.run(remote + [MOSH_PROBE],
                                 env=env, capture_output=True, text=True, timeout=15, check=False)
         if result.returncode == 0 and result.stdout.strip() == 'XP_MOSH_READY':
             return mosh_binary
@@ -764,17 +791,21 @@ def connect_native(host, mosh_binary=None, prepare=False):
             if mosh_binary:
                 # Mosh uses SSH only to start mosh-server. Keep the same host-key
                 # checks and temporary credential helpers for that bootstrap.
-                argv = [mosh_binary, '--ssh=' + shlex.join(argv), '--',
+                argv = [mosh_binary, '--ssh=' + shlex.join(argv), '--server=' + MOSH_SERVER, '--',
                         host['username'] + '@' + host['ip']]
             else:
                 argv += ['--', host['ip']]
             try:
-                return subprocess.call(argv, env=env)
+                status = subprocess.call(argv, env=env)
+                # Successful exits and explicit interruptions must not reopen a
+                # shell. Keep terminal streams inherited for interactive Mosh.
+                if not mosh_binary or status in (0, 129, 130, 143, -1, -2, -15):
+                    return status
             except OSError:
                 if not mosh_binary:
                     raise
-                print('Could not start Mosh; using SSH.', file=sys.stderr)
-                return subprocess.call(ssh_argv, env=env)
+            print('Mosh failed; using SSH.', file=sys.stderr)
+            return subprocess.call(ssh_argv, env=env)
         finally:
             if keyfd is not None:
                 os.close(keyfd)

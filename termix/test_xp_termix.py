@@ -8,6 +8,7 @@ import shlex
 import socket
 import subprocess
 import tempfile
+import tarfile
 import threading
 import time
 import unittest
@@ -215,10 +216,10 @@ class NativeTests(unittest.TestCase):
              contextlib.redirect_stderr(io.StringIO()):
             self.assertIsNone(xp.prepare_mosh(['ssh'], {}, '192.0.2.1', None))
 
-    def test_mosh_start_failure_falls_back_but_session_status_does_not(self):
+    def test_mosh_start_failures_fall_back_but_success_and_interrupt_do_not(self):
         host = {'ip': '192.0.2.1', 'port': 22, 'username': 'root',
                 'password': 'secret', 'key': None, 'unavailable_reason': ''}
-        for results in ([OSError('missing binary'), 0], [4]):
+        for results in ([OSError('missing binary'), 0], [1, 0], [4, 7], [0], [130], [-2], [143]):
             with patch.object(xp.shutil, 'which', return_value='/usr/bin/ssh'), \
                  patch.object(xp.subprocess, 'call', side_effect=results) as shell, \
                  contextlib.redirect_stderr(io.StringIO()):
@@ -226,6 +227,45 @@ class NativeTests(unittest.TestCase):
                 self.assertEqual(shell.call_count, len(results))
                 if len(results) == 2:
                     self.assertEqual(shell.call_args.args[0][0], '/usr/bin/ssh')
+
+    def test_mosh_locale_probe_and_server_use_available_utf8(self):
+        for locales, native, expected in ((['C', 'C.utf8', 'POSIX'], False, 'C.utf8'),
+                                          (['C', 'en_GB.UTF-8'], False, 'en_GB.UTF-8'),
+                                          (['C'], False, None),
+                                          (['C'], True, 'en_US.UTF-8')):
+            with self.subTest(locales=locales, native=native), tempfile.TemporaryDirectory() as folder:
+                path = Path(folder)
+                locale = path / 'locale'
+                locale.write_text('#!/bin/sh\n'
+                                  'case "$1" in\n'
+                                  '-a) printf "%s\\n" ' + shlex.join(locales) + ';;\n'
+                                  'charmap) case "${LC_ALL:-$LC_CTYPE}" in\n' +
+                                  ('en_US.UTF-8) echo UTF-8;;\n' if native else '') +
+                                  'C.utf8|en_GB.UTF-8) echo UTF-8;;\n'
+                                  '*) echo US-ASCII; exit 1;; esac;; esac\n')
+                locale.chmod(0o700)
+                server = path / 'mosh-server'
+                server.write_text('#!/bin/sh\nprintf "%s\\n" "$LC_ALL" "$LANG" "$@"\n')
+                server.chmod(0o700)
+                env = {**os.environ, 'PATH': folder + os.pathsep + os.environ['PATH'],
+                       'LANG': 'en_US.UTF-8', 'LC_CTYPE': 'en_US.UTF-8',
+                       'LC_MESSAGES': 'unavailable.UTF-8', 'LC_ALL': ''}
+                probe = subprocess.run(['/bin/sh', '-c', xp.MOSH_PROBE], env=env,
+                                       capture_output=True, text=True)
+                bootstrap = subprocess.run(['/bin/sh', '-c', xp.MOSH_SERVER +
+                                            " new -l LANG=en_US.UTF-8 -- 'command with spaces'"],
+                                           env=env, capture_output=True, text=True)
+                if expected:
+                    self.assertEqual(probe.stdout, 'XP_MOSH_READY')
+                    self.assertEqual(probe.returncode, 0)
+                    self.assertEqual(bootstrap.returncode, 0, bootstrap.stderr)
+                    self.assertEqual(bootstrap.stdout.splitlines(),
+                                     [expected, expected, 'new', '-l', 'LANG=en_US.UTF-8',
+                                      '--', 'command with spaces'])
+                else:
+                    self.assertNotEqual(probe.returncode, 0)
+                    self.assertNotEqual(bootstrap.returncode, 0)
+                    self.assertEqual(bootstrap.stdout, '')
 
     def test_package_install_uses_root_or_noninteractive_sudo(self):
         for uid, sudo_status, expected in (('0', 0, True), ('1000', 0, True), ('1000', 1, False)):
@@ -586,6 +626,37 @@ class CascadeTests(unittest.TestCase):
         for urls in (['https://one.invalid'],['https://one.invalid','https://one.invalid/'],
                      ['http://one.invalid','https://two.invalid'],['https://one.invalid/path','https://two.invalid']):
             with self.assertRaises(xp.Error): xp.validate_servers(urls)
+
+
+class UpdateScriptTests(unittest.TestCase):
+    def test_update_preserves_installer_activation_and_stops_on_download_failure(self):
+        for download_status in (0, 22):
+            with self.subTest(download_status=download_status), tempfile.TemporaryDirectory() as folder:
+                path = Path(folder)
+                install = path / 'install.py'
+                install.write_text('import os, pathlib, sys\n'
+                                   'assert sys.argv[1:] == ["--activate"]\n'
+                                   'pathlib.Path(os.environ["UPDATE_LOG"]).write_text("activated")\n')
+                archive = path / 'source.tar.gz'
+                with tarfile.open(archive, 'w:gz') as bundle:
+                    bundle.add(install, arcname='xp-test/termix/install.py')
+                curl = path / 'curl'
+                curl.write_text('#!/bin/sh\n'
+                                '[ "$2" = "https://github.com/wlatic/xp/archive/test-revision.tar.gz" ] || exit 99\n'
+                                'printf "%s" "$4" > "$UPDATE_DOWNLOAD"\n'
+                                'cp "$UPDATE_ARCHIVE" "$4"\n'
+                                'exit ' + str(download_status) + '\n')
+                curl.chmod(0o700)
+                log = path / 'updated'
+                download = path / 'download'
+                result = subprocess.run(['bash', str(Path(__file__).with_name('update.sh'))],
+                                        env={**os.environ, 'PATH': folder + os.pathsep + os.environ['PATH'],
+                                             'XP_REVISION': 'test-revision', 'UPDATE_ARCHIVE': str(archive),
+                                             'UPDATE_LOG': str(log), 'UPDATE_DOWNLOAD': str(download)},
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, download_status, result.stderr)
+                self.assertEqual(log.exists(), download_status == 0)
+                self.assertFalse(Path(download.read_text()).parent.exists())
 
 
 if __name__ == '__main__':
