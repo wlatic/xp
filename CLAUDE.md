@@ -10,6 +10,11 @@ Updating preserves keyring credentials and the encrypted cache.
 checking remote `mosh-server` with the saved OpenSSH credentials and normal host
 key checks. Missing client/server means SSH for this invocation, plus a detached,
 120-second, best-effort package install using root or noninteractive sudo.
+Preflight timeout/nohup/package-manager/privileges before claiming an install
+started. Keep install output/status private under XDG_STATE_HOME/xp-termix;
+report prior failures and pending jobs. Do not start duplicate jobs. The pending
+lock expires after 150 seconds; explicit XP_MOSH_INSTALL_RETRY=1 retries completed
+jobs and retains the previous log. Force-kill after a five-second timeout grace.
 A failed check or install must never prevent opening SSH. Before Mosh starts,
 validate the native UTF-8 charmap or select an installed UTF-8 locale with
 `locale -a`; set LANG/LC_ALL only in its server wrapper, never global config.

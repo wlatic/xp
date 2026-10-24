@@ -2,7 +2,7 @@
 
 Manage hosts and credentials on the Termix website, then type `xp` in Ghostty on Linux. For a directly reachable host, `xp` uses Mosh when both the laptop client and remote `mosh-server` are installed, bootstrapping with your computer's OpenSSH client and the saved Termix credential. Without Mosh, it uses OpenSSH. When a target is not directly reachable (for example, a private home server while traveling), `xp` opens the selected host through the remote Termix server in the same Ghostty window. Neither route needs the Termix desktop app running.
 
-If Mosh is missing on either end, `xp ai` opens this session with normal SSH and attempts to install the missing package in the background for your next connection. Installation uses the system package manager (apt-get, dnf, yum, apk, pacman or zypper), requires root or passwordless `sudo`, never prompts for a sudo password, and stops after 120 seconds. It is best effort: unavailable package tools, permissions or failed downloads leave SSH usable. You can install manually with `sudo dnf install mosh` on Fedora or `sudo apt install mosh` on Debian. Mosh startup selects a UTF-8 locale already available on the host (for example `C.utf8`) when the forwarded laptop locale is unavailable; this only changes the Mosh process environment. If no usable UTF-8 locale is available, or Mosh exits with a failure, the launcher falls back to SSH. Successful exits and explicit signal interruptions do not open another shell. An unsuccessful remote Mosh check also falls back to SSH; it does not attempt installation when the remote state is unknown. Mosh needs UDP from the laptop to the host, normally ports 60000–61000. The AI processes should stay in remote tmux sessions; Mosh keeps the live terminal connected during brief network drops while tmux preserves sessions and scrollback. `xp --direct ai` forces plain OpenSSH if Mosh or its UDP route is unavailable. Mosh is only selected for directly reachable hosts; the remote Termix route remains `termix ssh`.
+If Mosh is missing on either end, `xp ai` opens this session with normal SSH and attempts to install the missing package in the background for your next connection. Installation uses the system package manager (apt-get, dnf, yum, apk, pacman or zypper), requires root or passwordless `sudo`, never prompts for a sudo password, and allows 120 seconds before termination (with a five-second kill grace period). It is best effort: unavailable package tools, permissions or failed downloads leave SSH usable. You can install manually with `sudo dnf install mosh` on Fedora or `sudo apt install mosh` on Debian. Mosh startup selects a UTF-8 locale already available on the host (for example `C.utf8`) when the forwarded laptop locale is unavailable; this only changes the Mosh process environment. If no usable UTF-8 locale is available, or Mosh exits with a failure, the launcher falls back to SSH. Successful exits and explicit signal interruptions do not open another shell. An unsuccessful remote Mosh check also falls back to SSH; it does not attempt installation when the remote state is unknown. Mosh needs UDP from the laptop to the host, normally ports 60000–61000. The AI processes should stay in remote tmux sessions; Mosh keeps the live terminal connected during brief network drops while tmux preserves sessions and scrollback. `xp --direct ai` forces plain OpenSSH if Mosh or its UDP route is unavailable. Mosh is only selected for directly reachable hosts; the remote Termix route remains `termix ssh`.
 
 Setup downloads an initial copy of your hosts and credentials. A user timer refreshes it daily; `xp` also attempts a refresh before connecting. Refresh has a five-second total deadline. If the server is unavailable, the last complete encrypted copy remains usable. `xp --offline` skips the server entirely.
 
@@ -190,3 +190,19 @@ The updater downloads the current `feat/termix-offline` source into a temporary
 directory and runs the same installer with `--activate`. Saved credentials,
 configuration and the encrypted host cache are preserved. To select an immutable
 release, download the script and run `XP_REVISION=<full-commit> bash update.sh`.
+
+### When automatic Mosh installation does not finish
+
+The launcher checks for a supported package manager, `timeout`, `nohup`, and root
+or passwordless `sudo` before announcing a background install. Missing privileges
+are reported directly; the SSH session still opens. No sudo password is requested.
+
+Install output and exit status are kept privately on the machine being installed:
+`${XDG_STATE_HOME:-$HOME/.local/state}/xp-termix/mosh-install/install.log` and
+`status`. The directory has mode 700 and files mode 600. Reconnecting while the
+job is pending does not start another install. An interrupted job can restart
+after 150 seconds. A completed failure is reported with its log path on the next
+connection. Check that log, fix the cause or install Mosh manually, then explicitly
+retry automatic installation with `XP_MOSH_INSTALL_RETRY=1 xp ai`. The previous
+log is retained as `install.previous.log`. Preflight failures are rechecked on
+every connection without needing this override.

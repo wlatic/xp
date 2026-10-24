@@ -176,21 +176,20 @@ class NativeTests(unittest.TestCase):
                  contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(xp.connect_native(host, mosh_binary='/usr/bin/mosh', prepare=True), 7)
                 self.assertEqual(len(probes), 2)
-                self.assertIn('nohup timeout 120', probes[1][-1])
+                self.assertIn('nohup sh -c', probes[1][-1])
+                self.assertIn('timeout -k 5 120 sh -c', probes[1][-1])
                 self.assertIn('</dev/null >/dev/null 2>&1 &', probes[1][-1])
 
     def test_ready_remote_selects_mosh_only_with_local_binary(self):
         result = subprocess.CompletedProcess([], 0, 'XP_MOSH_READY')
         with patch.object(xp.subprocess, 'run', return_value=result), \
-             patch.object(xp.subprocess, 'Popen') as install, \
-             patch.object(xp.shutil, 'which', return_value='/usr/bin/timeout'), \
+             patch.object(xp, 'report_mosh_install') as install, \
              contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(xp.prepare_mosh(['ssh'], {}, '192.0.2.1', '/usr/bin/mosh'), '/usr/bin/mosh')
             install.assert_not_called()
             self.assertIsNone(xp.prepare_mosh(['ssh'], {}, '192.0.2.1', None))
-            self.assertEqual(install.call_args.args[0][:2], ['/usr/bin/timeout', '120'])
-            self.assertTrue(install.call_args.kwargs['start_new_session'])
-            self.assertEqual(install.call_args.kwargs['stdin'], subprocess.DEVNULL)
+            self.assertEqual(install.call_args.args[0][:2], ['sh', '-c'])
+            self.assertEqual(install.call_args.args[2], 'locally')
 
     def test_mosh_preparation_failures_never_block_ssh(self):
         host = {'ip': '192.0.2.1', 'port': 22, 'username': 'root',
@@ -210,11 +209,10 @@ class NativeTests(unittest.TestCase):
 
     def test_missing_local_install_failure_stays_on_ssh(self):
         result = subprocess.CompletedProcess([], 0, 'XP_MOSH_READY')
-        with patch.object(xp.subprocess, 'run', return_value=result), \
-             patch.object(xp.subprocess, 'Popen', side_effect=OSError('failed')), \
-             patch.object(xp.shutil, 'which', return_value='/usr/bin/timeout'), \
-             contextlib.redirect_stderr(io.StringIO()):
+        with patch.object(xp.subprocess, 'run', side_effect=[OSError('failed'), result]), \
+             contextlib.redirect_stderr(io.StringIO()) as output:
             self.assertIsNone(xp.prepare_mosh(['ssh'], {}, '192.0.2.1', None))
+            self.assertIn('could not prepare install', output.getvalue())
 
     def test_mosh_start_failures_fall_back_but_success_and_interrupt_do_not(self):
         host = {'ip': '192.0.2.1', 'port': 22, 'username': 'root',
@@ -299,8 +297,11 @@ class NativeTests(unittest.TestCase):
             command = run.call_args.args[0][-1]
         # Capturing pipes would wait for the installer if it inherited SSH's
         # streams. The package job deliberately outlasts this shell's deadline.
-        result = subprocess.run(['/bin/sh', '-c', command], capture_output=True, timeout=0.3)
-        self.assertEqual(result.returncode, 0)
+        with tempfile.TemporaryDirectory() as folder:
+            result = subprocess.run(['/bin/sh', '-c', command], env={**os.environ, 'XDG_STATE_HOME': folder},
+                                    capture_output=True, timeout=0.3)
+            self.assertEqual(result.returncode, 0)
+            time.sleep(0.5)
 
     def test_explicit_remote_selection_skips_direct_probe(self):
         host = {'ip': '10.0.10.100', 'port': 22, 'username': 'root'}
@@ -626,6 +627,84 @@ class CascadeTests(unittest.TestCase):
         for urls in (['https://one.invalid'],['https://one.invalid','https://one.invalid/'],
                      ['http://one.invalid','https://two.invalid'],['https://one.invalid/path','https://two.invalid']):
             with self.assertRaises(xp.Error): xp.validate_servers(urls)
+
+
+class MoshInstallStatusTests(unittest.TestCase):
+    def fixture(self, folder, *, missing=(), uid='0'):
+        path = Path(folder)
+        binary = path / 'bin'
+        binary.mkdir()
+        for name in ('sh', 'timeout', 'nohup', 'mkdir', 'chmod', 'cat', 'date', 'rmdir', 'mv', 'rm', 'stat'):
+            if name not in missing:
+                (binary / name).symlink_to(xp.shutil.which(name))
+        for name, script in {'id': 'printf "%s" ' + uid,
+                             'sudo': 'exit 1', 'apt-get': 'exit 99'}.items():
+            if name not in missing:
+                target = binary / name
+                target.write_text('#!/bin/sh\n' + script + '\n')
+                target.chmod(0o700)
+        return {**os.environ, 'PATH': str(binary), 'XDG_STATE_HOME': str(path / 'state')}
+
+    def invoke(self, env, retry=False):
+        return subprocess.run(['/bin/sh', '-c', xp.mosh_install_command(retry)], env=env,
+                              capture_output=True, text=True, timeout=1)
+
+    def wait_for_status(self, state):
+        for _ in range(100):
+            if (state / 'status').exists() and not (state / 'pending').exists():
+                return
+            time.sleep(0.01)
+        self.fail('bounded mock worker did not finish')
+
+    def test_preflight_reports_blockers_without_starting_installs(self):
+        for missing, uid, reason in ((('timeout',), '0', 'timeout is missing'),
+                                     (('apt-get',), '0', 'unsupported package manager'),
+                                     ((), '1000', 'root or passwordless sudo')):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as folder:
+                env = self.fixture(folder, missing=missing, uid=uid)
+                result = self.invoke(env)
+                self.assertEqual(result.returncode, 0)
+                self.assertIn(reason, result.stdout)
+                self.assertNotIn('Started', result.stdout)
+                self.assertFalse((Path(folder) / 'state').exists())
+
+    def test_pending_and_completed_jobs_report_status_and_keep_private_logs(self):
+        for status in (0, 23):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as folder, \
+                 patch.object(xp, 'MOSH_INSTALL', 'printf "mock package result"; /bin/sleep 0.2; exit ' + str(status)):
+                env = self.fixture(folder)
+                state = Path(env['XDG_STATE_HOME']) / 'xp-termix/mosh-install'
+                first = self.invoke(env)
+                self.assertIn('Started background install', first.stdout)
+                pending = self.invoke(env)
+                self.assertIn('already pending', pending.stdout)
+                self.wait_for_status(state)
+                self.assertEqual((state / 'status').read_text().strip(), str(status))
+                self.assertEqual((state / 'install.log').read_text(), 'mock package result')
+                self.assertEqual(state.stat().st_mode & 0o777, 0o700)
+                self.assertEqual((state / 'install.log').stat().st_mode & 0o777, 0o600)
+                self.assertEqual((state / 'status').stat().st_mode & 0o777, 0o600)
+                completed = self.invoke(env)
+                self.assertIn('Previous install finished' if status == 0 else 'Previous install failed (exit 23)', completed.stdout)
+                self.assertIn('install.log', completed.stdout)
+                self.assertNotIn('Started background install', completed.stdout)
+                retry = self.invoke(env, retry=True)
+                self.assertIn('Started background install', retry.stdout)
+                self.assertIn('install.previous.log', retry.stdout)
+                self.assertEqual((state / 'install.previous.log').read_text(), 'mock package result')
+                self.wait_for_status(state)
+
+    def test_stale_pending_install_can_retry(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(xp, 'MOSH_INSTALL', 'exit 0'):
+            env = self.fixture(folder)
+            state = Path(env['XDG_STATE_HOME']) / 'xp-termix/mosh-install'
+            (state / 'pending').mkdir(parents=True)
+            (state / 'started').write_text('1')
+            result = self.invoke(env)
+            self.assertIn('Previous install was interrupted; retrying', result.stdout)
+            self.assertIn('Started background install', result.stdout)
+            self.wait_for_status(state)
+
 
 
 class UpdateScriptTests(unittest.TestCase):

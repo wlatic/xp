@@ -689,18 +689,81 @@ MOSH_PROBE = ('if ! command -v mosh-server >/dev/null 2>&1; then '
               'printf XP_MOSH_MISSING; exit 0; fi\n' + MOSH_UTF8 + 'printf XP_MOSH_READY')
 
 
+def mosh_install_command(retry=False):
+    """Prepare a private, detached install; print status, never package output."""
+    worker = ('timeout -k 5 120 sh -c ' + shlex.quote(MOSH_INSTALL) +
+              ' >"$1/install.log" 2>&1; xp_code=$?; '
+              'printf "%s\\n" "$xp_code" >"$1/status"; rmdir "$1/pending"')
+    return ("XP_MOSH_INSTALL_RETRY=1\n" if retry else "") + """umask 077
+for xp_tool in timeout nohup; do
+    command -v "$xp_tool" >/dev/null 2>&1 || {
+        printf 'Automatic install unavailable: %s is missing.\n' "$xp_tool"; exit 0;
+    }
+done
+xp_manager=
+for xp_tool in apt-get dnf yum apk pacman zypper; do
+    if command -v "$xp_tool" >/dev/null 2>&1; then xp_manager=$xp_tool; break; fi
+done
+[ -n "$xp_manager" ] || { printf 'Automatic install unavailable: unsupported package manager.\n'; exit 0; }
+if [ "$(id -u)" != 0 ]; then
+    if ! command -v sudo >/dev/null 2>&1 || ! timeout -k 1 5 sudo -n true >/dev/null 2>&1; then
+        printf 'Automatic install unavailable: root or passwordless sudo is required; install mosh manually.\n'
+        exit 0
+    fi
+fi
+xp_dir=${XDG_STATE_HOME:-$HOME/.local/state}/xp-termix/mosh-install
+mkdir -p "$xp_dir" && chmod 700 "$xp_dir" || { printf 'Cannot create private install log directory.\n'; exit 0; }
+if [ -d "$xp_dir/pending" ]; then
+    xp_now=$(date +%s)
+    xp_started=$(cat "$xp_dir/started" 2>/dev/null) || xp_started=$(stat -c %Y "$xp_dir/pending" 2>/dev/null) || xp_started=$xp_now
+    case "$xp_started" in ''|*[!0-9]*) xp_started=0;; esac
+    if [ "$((xp_now - xp_started))" -gt 150 ]; then
+        rmdir "$xp_dir/pending" 2>/dev/null || :
+        printf 'Previous install was interrupted; retrying.\n'
+    fi
+fi
+if [ -f "$xp_dir/status" ] && [ "${XP_MOSH_INSTALL_RETRY:-}" != 1 ]; then
+    xp_status=$(cat "$xp_dir/status")
+    if [ "$xp_status" = 0 ]; then
+        printf 'Previous install finished, but Mosh is still unavailable; log: %s/install.log\n' "$xp_dir"
+    else
+        printf 'Previous install failed (exit %s); log: %s/install.log\n' "$xp_status" "$xp_dir"
+    fi
+    printf 'To retry after fixing the cause, run: XP_MOSH_INSTALL_RETRY=1 xp ai\n'
+    exit 0
+fi
+if ! mkdir "$xp_dir/pending" 2>/dev/null; then
+    printf 'An install is already pending (or was interrupted); log: %s/install.log\n' "$xp_dir"
+    exit 0
+fi
+date +%s >"$xp_dir/started"
+if [ -f "$xp_dir/install.log" ]; then
+    mv "$xp_dir/install.log" "$xp_dir/install.previous.log"
+    printf 'Previous log retained: %s/install.previous.log\n' "$xp_dir"
+fi
+rm -f "$xp_dir/status"
+: >"$xp_dir/install.log"
+chmod 600 "$xp_dir/install.log"
+nohup sh -c """ + shlex.quote(worker) + """ xp-mosh-install "$xp_dir" </dev/null >/dev/null 2>&1 &
+printf 'Started background install for next time; log: %s/install.log\n' "$xp_dir"
+"""
+
+
+def report_mosh_install(command, env, location):
+    try:
+        result = subprocess.run(command, env=env, capture_output=True, text=True,
+                                timeout=15, check=False)
+        message = result.stdout.strip() if result.returncode == 0 else ''
+        print(f'Mosh install {location}: ' + (message or 'could not prepare install; using SSH.'), file=sys.stderr)
+    except (OSError, subprocess.TimeoutExpired):
+        print(f'Mosh install {location}: could not prepare install; using SSH.', file=sys.stderr)
+
+
 def prepare_mosh(ssh, env, host, mosh_binary):
     """Check both ends using saved SSH auth; missing tools keep this call on SSH."""
     if not mosh_binary:
-        print('Mosh is missing locally; using SSH. Attempting a background install for next time.', file=sys.stderr)
-        timeout = shutil.which('timeout')
-        if timeout:
-            try:
-                subprocess.Popen([timeout, '120', 'sh', '-c', MOSH_INSTALL],
-                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, start_new_session=True)
-            except OSError:
-                pass
+        print('Mosh is missing locally; using SSH.', file=sys.stderr)
+        report_mosh_install(['sh', '-c', mosh_install_command(env.get('XP_MOSH_INSTALL_RETRY') == '1')], env, 'locally')
     remote = ssh + ['-T', '--', host]
     try:
         result = subprocess.run(remote + [MOSH_PROBE],
@@ -708,12 +771,8 @@ def prepare_mosh(ssh, env, host, mosh_binary):
         if result.returncode == 0 and result.stdout.strip() == 'XP_MOSH_READY':
             return mosh_binary
         if result.returncode == 0 and result.stdout.strip() == 'XP_MOSH_MISSING':
-            print('Mosh is missing on the host; using SSH. Attempting a background install for next time.', file=sys.stderr)
-            command = ('command -v timeout >/dev/null 2>&1 && '
-                       'nohup timeout 120 sh -c ' + shlex.quote(MOSH_INSTALL) +
-                       ' </dev/null >/dev/null 2>&1 &')
-            subprocess.run(remote + [command], env=env, capture_output=True,
-                           timeout=15, check=False)
+            print('Mosh is missing on the host; using SSH.', file=sys.stderr)
+            report_mosh_install(remote + [mosh_install_command(env.get('XP_MOSH_INSTALL_RETRY') == '1')], env, 'on the host')
         else:
             print('Could not verify remote Mosh; using SSH.', file=sys.stderr)
     except (OSError, subprocess.TimeoutExpired):
